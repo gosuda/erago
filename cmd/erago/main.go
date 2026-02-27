@@ -13,6 +13,7 @@ func main() {
 	base := flag.String("base", ".", "base path containing script files and save files")
 	dir := flag.String("dir", "", "deprecated alias for -base")
 	entry := flag.String("entry", "TITLE", "entry function")
+	plain := flag.Bool("plain", false, "run without TUI (stdin/stdout mode)")
 	flag.Parse()
 
 	resolvedBase := strings.TrimSpace(*base)
@@ -27,6 +28,14 @@ func main() {
 	cfg := appConfig{
 		base:  resolvedBase,
 		entry: *entry,
+	}
+
+	if *plain {
+		if err := runPlain(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "plain: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	p := tea.NewProgram(newModel(cfg))

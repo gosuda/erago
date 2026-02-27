@@ -34,6 +34,12 @@ var (
 	inputStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("24")).Padding(0, 1)
 )
 
+const (
+	maxStreamEvents = 12000
+	maxHistoryLines = 2500
+	maxTailBytes    = 8192
+)
+
 func newModel(cfg appConfig) model {
 	vp := viewport.New(
 		viewport.WithWidth(80),
@@ -98,11 +104,14 @@ func sendInputResp(ch chan vmInputResp, resp vmInputResp) {
 
 func isEnterKey(msg tea.KeyMsg) bool {
 	k := msg.Key()
-	if k.Code == tea.KeyEnter || k.Code == tea.KeyKpEnter {
+	if k.Code == tea.KeyEnter || k.Code == tea.KeyKpEnter || k.Code == '\r' || k.Code == '\n' {
+		return true
+	}
+	if strings.Contains(k.Text, "\r") || strings.Contains(k.Text, "\n") {
 		return true
 	}
 	switch msg.String() {
-	case "enter", "ctrl+m":
+	case "enter", "kpenter", "ctrl+m", "ctrl+j":
 		return true
 	default:
 		return false
@@ -187,10 +196,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitVMEvent(m.events)
 
 	case vmPollMsg:
-		if m.running && m.pending == nil {
-			return m, waitVMEvent(m.events)
-		}
-		return m, nil
+		// Always continue polling to keep the event loop alive
+		return m, waitVMEvent(m.events)
 
 	case vmPromptMsg:
 		m.seq++
@@ -213,19 +220,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(
 				timeoutCmd(m.pending.seq, time.Duration(msg.req.TimeoutMs)*time.Millisecond),
 				countdownCmd(m.pending.seq),
+				waitVMEvent(m.events),
 			)
 		}
 		if msg.req.Timed {
-			return m, timeoutCmd(m.pending.seq, time.Duration(msg.req.TimeoutMs)*time.Millisecond)
+			return m, tea.Batch(
+				timeoutCmd(m.pending.seq, time.Duration(msg.req.TimeoutMs)*time.Millisecond),
+				waitVMEvent(m.events),
+			)
 		}
-		return m, nil
+		return m, waitVMEvent(m.events)
 
 	case vmCountdownMsg:
 		if m.pending != nil && m.pending.seq == msg.seq && m.pending.req.Timed && m.pending.req.Countdown {
 			m.setPromptStatus()
-			return m, countdownCmd(msg.seq)
+			return m, tea.Batch(countdownCmd(msg.seq), waitVMEvent(m.events))
 		}
-		return m, nil
+		return m, waitVMEvent(m.events)
 
 	case vmTimeoutMsg:
 		if m.pending != nil && m.pending.seq == msg.seq && m.pending.req.Timed {
@@ -235,7 +246,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "running"
 			return m, waitVMEvent(m.events)
 		}
-		return m, nil
+		return m, waitVMEvent(m.events)
 
 	case vmDoneMsg:
 		m.running = false
@@ -340,10 +351,33 @@ func (m *model) appendOutput(out eruntime.Output) {
 			n = len(m.stream)
 		}
 		m.stream = m.stream[:len(m.stream)-n]
-	} else {
-		m.stream = append(m.stream, out)
+		m.rebuildContent()
+		return
 	}
-	m.rebuildContent()
+
+	m.stream = append(m.stream, out)
+	if len(m.stream) > maxStreamEvents {
+		m.stream = m.stream[len(m.stream)-maxStreamEvents:]
+	}
+
+	if out.NewLine {
+		m.history = append(m.history, m.tail+out.Text)
+		m.tail = ""
+	} else {
+		m.tail += out.Text
+		if len(m.tail) > maxTailBytes {
+			m.tail = m.tail[len(m.tail)-maxTailBytes:]
+		}
+	}
+	m.trimHistory()
+	m.renderContent()
+}
+
+func (m *model) trimHistory() {
+	if len(m.history) <= maxHistoryLines {
+		return
+	}
+	m.history = append([]string(nil), m.history[len(m.history)-maxHistoryLines:]...)
 }
 
 func (m *model) rebuildContent() {
@@ -355,8 +389,16 @@ func (m *model) rebuildContent() {
 			m.tail = ""
 		} else {
 			m.tail += out.Text
+			if len(m.tail) > maxTailBytes {
+				m.tail = m.tail[len(m.tail)-maxTailBytes:]
+			}
 		}
 	}
+	m.trimHistory()
+	m.renderContent()
+}
+
+func (m *model) renderContent() {
 	content := strings.Join(m.history, "\n")
 	if m.tail != "" {
 		if content != "" {

@@ -1728,11 +1728,25 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 	case "HTML_PRINT":
 		outText := ""
 		if strings.TrimSpace(arg) != "" {
-			if v, err := vm.evalLooseExpr(arg); err == nil {
+			resolved := false
+			if v, err := vm.evalLooseExpr(arg); err == nil && !isLooseFallbackValue(v, arg) {
 				outText = v.String()
-			} else {
-				outText = decodeCommandCharSeq(arg)
-				if s, ok := tryUnquoteCommandString(outText); ok {
+				resolved = true
+			}
+			if !resolved {
+				if expanded, err := vm.expandDecodedTemplate(arg); err == nil {
+					if v, err := vm.evalLooseExpr(expanded); err == nil && !isLooseFallbackValue(v, expanded) {
+						outText = v.String()
+						resolved = true
+					} else {
+						outText = expanded
+					}
+				} else {
+					outText = decodeCommandCharSeq(arg)
+				}
+			}
+			if !resolved {
+				if s, ok := tryUnquoteCommandString(strings.TrimSpace(outText)); ok {
 					outText = s
 				}
 			}
@@ -1745,12 +1759,20 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 			if t, err := vm.evalBracePlaceholders(outText); err == nil {
 				outText = t
 			}
+			if t, err := vm.evalAtPlaceholders(outText); err == nil {
+				outText = t
+			}
 			if outText == prev {
 				break
 			}
 		}
 		outText = html.UnescapeString(outText)
 		outText = htmlTagPattern.ReplaceAllString(outText, "")
+		upperOut := strings.ToUpper(outText)
+		if strings.Contains(upperOut, "HTMLFONT(") || strings.Contains(upperOut, "HTMLBUTTON(") || strings.Contains(upperOut, "HTML_COLORBAR(") {
+			// Guardrail: avoid dumping unresolved HTML helper expressions verbatim.
+			outText = ""
+		}
 		if strings.TrimSpace(outText) != "" {
 			vm.emitOutput(Output{Text: outText, NewLine: true})
 		}
@@ -4953,6 +4975,10 @@ func (vm *VM) evalLooseExpr(raw string) (Value, error) {
 		return Value{}, err
 	}
 	return vm.evalExpr(e)
+}
+
+func isLooseFallbackValue(v Value, raw string) bool {
+	return v.Kind() == StringKind && strings.TrimSpace(v.String()) == strings.TrimSpace(raw)
 }
 
 func looksLikeCallArgExpr(raw string) bool {

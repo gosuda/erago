@@ -1622,3 +1622,61 @@ QUIT
 			foundBefore, foundWaiting, foundAfter, foundResult, out)
 	}
 }
+
+func TestFullGameFlow(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@SYSTEM_TITLE
+PRINTL [0] Start
+PRINTL [1] Load
+$TITLE_INPUT
+INPUT
+IF RESULT == 0
+    PRINTL Starting game...
+    RETURN
+ELSEIF RESULT == 1
+    PRINTL Loading...
+    GOTO TITLE_INPUT
+ELSE
+    PRINTL Invalid value.
+    GOTO TITLE_INPUT
+ENDIF
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+
+	// Set up input provider
+	inputCalls := 0
+	vm.SetInputProvider(func(req eruntime.InputRequest) (string, bool, error) {
+		inputCalls++
+		if inputCalls == 1 {
+			return "99", false, nil  // Invalid input first
+		}
+		return "0", false, nil  // Then valid input
+	})
+
+	out, err := vm.Run("SYSTEM_TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Check input was called twice (once for invalid, once for valid)
+	if inputCalls != 2 {
+		t.Fatalf("expected input to be called twice, got %d", inputCalls)
+	}
+
+	// Check output shows menu and then handles input
+	found := false
+	for _, o := range out {
+		if strings.Contains(o.Text, "Start") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected menu output, got %v", out)
+	}
+}
