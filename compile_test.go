@@ -151,7 +151,6 @@ QUIT
 	if err != nil {
 		t.Fatalf("compile failed: %v", err)
 	}
-	vm.SetSaveDir(t.TempDir())
 	out, err := vm.Run("TITLE")
 	if err != nil {
 		t.Fatalf("run failed: %v", err)
@@ -208,6 +207,7 @@ QUIT
 	if err != nil {
 		t.Fatalf("compile failed: %v", err)
 	}
+	vm.SetSaveDir(t.TempDir())
 	out, err := vm.Run("TITLE")
 	if err != nil {
 		t.Fatalf("run failed: %v", err)

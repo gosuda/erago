@@ -1,19 +1,20 @@
 @TITLE
-IF HP <= 0
-    HP = MAX_HP
-ENDIF
 IF DAY <= 0
-    DAY = 1
-ENDIF
-IF NAME == ""
     PRINTL Welcome to Mini Adventure.
     PRINTL Enter your name:
     INPUTS "Hero"
     NAME = RESULTS
+    IF NAME == ""
+        NAME = "Hero"
+    ENDIF
     GOLD = 5
     HP = MAX_HP
+    DAY = 1
     PRINTFORML Hello, {NAME}. Your journey begins.
     WAIT
+ENDIF
+IF HP <= 0
+    GOTO GAMEOVER
 ENDIF
 
 $MENU
@@ -108,6 +109,11 @@ $LOADPOINT
 LOADVAR "slot1"
 IF RESULT == 1
     PRINTL Loaded slot1.
+    IF HP <= 0
+        PRINTL Loaded save is in game over state.
+        WAIT
+        GOTO GAMEOVER
+    ENDIF
 ELSE
     PRINTL No save found.
 ENDIF
@@ -122,12 +128,29 @@ PRINTL 9) Quit
 INPUT 1
 G = RESULT
 IF G == 1
-    GOTO LOADPOINT
+    LOADVAR "slot1"
+    IF RESULT == 1
+        PRINTL Loaded slot1.
+        IF HP <= 0
+            PRINTL Loaded save is still game over.
+            WAIT
+            GOTO GAMEOVER
+        ENDIF
+        WAIT
+        GOTO MENU
+    ENDIF
+    PRINTL No save found.
+    WAIT
+    GOTO GAMEOVER
 ELSEIF G == 2
     NAME = ""
     HP = MAX_HP
     GOLD = 5
-    DAY = 1
+    DAY = 0
     GOTO TITLE
+ELSEIF G == 9
+    QUIT
 ENDIF
-QUIT
+PRINTL Invalid choice.
+WAIT
+GOTO GAMEOVER

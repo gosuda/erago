@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/lipgloss"
 	eruntime "github.com/gosuda/erago/runtime"
 )
@@ -30,18 +30,15 @@ type model struct {
 }
 
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("230")).
-			Background(lipgloss.Color("236")).
-			Padding(0, 1)
+	errStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	inputStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("24")).Padding(0, 1)
 )
 
 func newModel(cfg appConfig) model {
-	vp := viewport.New(80, 20)
+	vp := viewport.New(
+		viewport.WithWidth(80),
+		viewport.WithHeight(20),
+	)
 	ti := textinput.New()
 	ti.Prompt = "> "
 	ti.CharLimit = 4096
@@ -150,8 +147,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if vh < 1 {
 			vh = 1
 		}
-		m.viewport.Width = msg.Width
-		m.viewport.Height = vh
+		m.viewport.SetWidth(msg.Width)
+		m.viewport.SetHeight(vh)
 		m.ready = true
 		return m, nil
 
@@ -175,11 +172,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			deadline: time.Now().Add(time.Duration(msg.req.TimeoutMs) * time.Millisecond),
 		}
 		m.input.SetValue("")
-		if msg.req.HasDefault {
-			m.input.Placeholder = msg.req.DefaultValue.String()
-		} else {
-			m.input.Placeholder = ""
-		}
+		m.input.Placeholder = ""
 		if m.pending.isWait {
 			m.input.Blur()
 		} else {
@@ -244,9 +237,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.String() == "enter" {
 				val := strings.TrimSpace(m.input.Value())
-				if val == "" && m.pending.req.HasDefault {
-					val = m.pending.req.DefaultValue.String()
-				}
 				if m.pending.req.Numeric && val != "" && !isStrictInt(val) {
 					m.status = "numeric input required"
 					return m, nil
@@ -290,23 +280,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) View() string {
-	title := titleStyle.Render(fmt.Sprintf("erago  base=%s  entry=%s  savefmt=%s", m.cfg.base, m.cfg.entry, m.cfg.savef))
+func (m model) View() tea.View {
 	if !m.ready {
-		return title + "\n\ninitializing..."
+		v := tea.NewView("initializing...")
+		v.AltScreen = true
+		return v
 	}
-	help := helpStyle.Render("j/k, pgup/pgdn scroll | g/G top/bottom | r rerun | q quit | ctrl+c force quit")
-	status := statusStyle.Render(m.status)
-
-	parts := []string{title, m.viewport.View()}
+	parts := []string{m.viewport.View()}
 	if m.pending != nil {
-		parts = append(parts, helpStyle.Render(m.currentPromptText()))
 		if !m.pending.isWait {
 			parts = append(parts, inputStyle.Render(m.input.View()))
 		}
 	}
-	parts = append(parts, help, status)
-	return strings.Join(parts, "\n")
+	v := tea.NewView(strings.Join(parts, "\n"))
+	v.AltScreen = true
+	return v
 }
 
 func (m *model) appendOutput(out eruntime.Output) {
@@ -338,34 +326,6 @@ func (m *model) clearForRestart() {
 	m.seq = 0
 	m.input.Blur()
 	m.input.SetValue("")
-}
-
-func (m *model) currentPromptText() string {
-	if m.pending == nil {
-		return ""
-	}
-	cmd := strings.ToUpper(strings.TrimSpace(m.pending.req.Command))
-	parts := []string{"[" + cmd + "]"}
-	if m.pending.req.Timed && m.pending.req.TimeoutMs > 0 {
-		if m.pending.req.Countdown {
-			sec := ceilSeconds(time.Until(m.pending.deadline))
-			if sec < 0 {
-				sec = 0
-			}
-			parts = append(parts, fmt.Sprintf("timeout %ds", sec))
-		} else {
-			parts = append(parts, "timed input")
-		}
-	}
-	if m.pending.req.HasDefault {
-		parts = append(parts, "default="+m.pending.req.DefaultValue.String())
-	}
-	if m.pending.isWait {
-		parts = append(parts, "press any key")
-	} else {
-		parts = append(parts, "type then Enter")
-	}
-	return strings.Join(parts, " | ")
 }
 
 func (m *model) setPromptStatus() {

@@ -6,14 +6,13 @@ import (
 	"os"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func main() {
 	base := flag.String("base", ".", "base path containing script files and save files")
 	dir := flag.String("dir", "", "deprecated alias for -base")
 	entry := flag.String("entry", "TITLE", "entry function")
-	savef := flag.String("savefmt", "json", "SAVEVAR/SAVECHARA format: json|binary|both")
 	flag.Parse()
 
 	resolvedBase := strings.TrimSpace(*base)
@@ -28,10 +27,9 @@ func main() {
 	cfg := appConfig{
 		base:  resolvedBase,
 		entry: *entry,
-		savef: *savef,
 	}
 
-	p := tea.NewProgram(newModel(cfg), tea.WithAltScreen())
+	p := tea.NewProgram(newModel(cfg))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
 		os.Exit(1)

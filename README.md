@@ -1,51 +1,92 @@
 # erago
 
-`erago` is a Go CLI/runtime for running Emuera-style `ERB/ERH/CSV` game files.
+`erago` is a Go runtime/CLI for Emuera-style game files (`.erb`, `.erh`, `.csv`).
 
 ## Prerequisites
 
 - Go `1.25+`
 
-## Project Layout
+## Quick Start
 
-- Put game files under a folder such as `era_files/<game_name>/`.
-- Example included in this repo:
-  - `era_files/mini_adventure`
-
-## Quick Start (Run From Source)
+Run directly from source:
 
 ```bash
-go run ./cmd/erago -base ./era_files/mini_adventure -entry TITLE
+go run ./cmd/erago -base ./era_files/1_adventure -entry TITLE
 ```
 
-## Build and Run Binary
+## Build Directory
 
-Build:
+All build/deploy source assets are under `build/`:
+
+- `build/web/index.html`: web runner UI
+- `build/web/main_js.go`: wasm entry (`js/wasm`)
+- `build/mobile/bridge.go`: gomobile bridge API
+
+Use `Makefile` for build/release commands.
+
+## Desktop + Web Build
+
+Build Linux/macOS/Windows binaries and web wasm bundle:
 
 ```bash
-go build -o ./bin/erago ./cmd/erago
+make build
 ```
 
-Run:
+Output artifacts:
+
+- `dist/linux-amd64/erago`
+- `dist/linux-arm64/erago`
+- `dist/darwin-amd64/erago`
+- `dist/darwin-arm64/erago`
+- `dist/windows-amd64/erago.exe`
+- `dist/windows-arm64/erago.exe`
+- `dist/web/index.html`
+- `dist/web/wasm_exec.js`
+- `dist/web/erago.wasm`
+
+Run desktop binary:
 
 ```bash
-./bin/erago -base ./era_files/mini_adventure -entry TITLE -savefmt json
+./dist/linux-amd64/erago -base ./era_files/2_dialog_tool -entry TITLE
 ```
 
-Build + run in one command:
+Run web build locally:
 
 ```bash
-go build -o ./bin/erago ./cmd/erago && ./bin/erago -base ./era_files/mini_adventure -entry TITLE -savefmt json
+make serve-web
 ```
+
+In the browser:
+- choose a game folder that contains `.erb/.erh/.csv`
+- add expected `INPUT` values to the queue
+- click `Run`
+
+## Mobile Build
+
+Install gomobile (one-time):
+
+```bash
+go install golang.org/x/mobile/cmd/gomobile@latest
+```
+
+Build Android/iOS packages:
+
+```bash
+make mobile
+```
+
+Output artifacts:
+
+- `dist/mobile/erago_mobile.aar` (Android)
+- `dist/mobile/EragoMobile.xcframework` (iOS)
 
 ## CLI Options
 
-- `-base`: base directory containing `.erb/.erh/.csv` and save files
-- `-dir`: deprecated alias for `-base`
-- `-entry`: entry function name (default: `TITLE`)
-- `-savefmt`: save payload format (`json`, `binary`, `both`)
+- `-base`: base directory containing game files and save files
+- `-dir`: deprecated alias of `-base`
+- `-entry`: entry function (default: `TITLE`)
 
-See all options:
+Show help:
 
 ```bash
 go run ./cmd/erago -h
@@ -53,25 +94,5 @@ go run ./cmd/erago -h
 
 ## Save Files
 
-- Save files are written under the same directory passed to `-base`.
-- `SAVEVAR/SAVECHARA` support:
-  - `json`: JSON payload in `.dat`
-  - `binary`: Emuera-style binary `.dat`
-  - `both`: binary `.dat` + companion `.json`
-
-## TUI Controls
-
-- `q`: quit
-- `r`: rerun
-- `j/k`, `pgup/pgdn`: scroll
-- `g/G`: top/bottom
-- `ctrl+c`: force quit
-
-## Save Format Converter
-
-Convert save data between JSON and binary:
-
-```bash
-go run ./cmd/savecodec -kind var -in ./save/var_case1.dat -out ./save/var_case1.bin.dat -to binary
-go run ./cmd/savecodec -kind var -in ./save/var_case1.bin.dat -out ./save/var_case1.json -to json
-```
+- Save files are written to the same path as `-base`.
+- `cmd/erago` writes `SAVEVAR/SAVECHARA` as Emuera-style binary `.dat`.

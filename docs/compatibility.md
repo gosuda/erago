@@ -1,6 +1,6 @@
-# Emuera Compatibility Status (Native Go)
+# Emuera Compatibility Status
 
-This project targets full native compatibility with Emuera without JS binding.
+This project targets full native compatibility with Emuera
 
 ## Command coverage snapshot
 
@@ -31,8 +31,8 @@ Implemented execution entries (native runtime):
   - Method-like command baseline (`ABS`, `SIGN`, `MAX`, `MIN`, `POWER`, `SQRT`, `LIMIT`, `INRANGE`, `RAND`, `STRLEN*`, `STRFIND*`, `SUBSTRING*`, `TOINT`, `TOSTR`, `EXISTCSV`)
   - Variable/bit operation baseline (`VARSET`, `CVARSET`, `GETBIT`, `SETBIT`, `CLEARBIT`, `INVERTBIT`)
   - Block command baseline (`SELECTCASE`, `CASE`, `CASEELSE`, `ENDSELECT`, `STRDATA`, `PRINTDATA*`, `DATA`, `DATAFORM`, `ENDDATA`)
-  - Indexed variable baseline (`#DIM/#DIMS` ingest, `VAR:idx` read/write in parser/runtime, save/load 포함)
-  - Scope/prefix baseline (`LOCAL/DYNAMIC/REF` 처리 시작, function property `#DIM` local 반영)
+  - Indexed variable baseline (`#DIM/#DIMS` ingest, `VAR:idx` read/write in parser/runtime, save/load )
+  - Scope/prefix baseline
   - Additional command families:
     - Array helpers (`ARRAYSHIFT`, `ARRAYREMOVE`, `SWAP`)
     - Character helpers baseline (`ADDCHARA*`, `DELCHARA*`, `GETCHARA`, `FINDCHARA*`, `SWAPCHARA`, `SORTCHARA`, `COPYCHARA`, `ADDCOPYCHARA`, `PICKUPCHARA`)

@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/gosuda/erago"
 	eruntime "github.com/gosuda/erago/runtime"
 )
@@ -24,7 +24,7 @@ func runVM(cfg appConfig, events chan<- tea.Msg) {
 		events <- vmDoneMsg{err: fmt.Errorf("compile: %w", err)}
 		return
 	}
-	if err := vm.SetDatSaveFormat(cfg.savef); err != nil {
+	if err := vm.SetDatSaveFormat("binary"); err != nil {
 		events <- vmDoneMsg{err: fmt.Errorf("save format: %w", err)}
 		return
 	}

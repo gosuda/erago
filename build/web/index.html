@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>erago web cmd</title>
+  <style>
+    :root {
+      --bg: #000000;
+      --fg: #e6e6e6;
+      --muted: #9a9a9a;
+      --line: #242424;
+      --accent: #3ddc84;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 14px;
+    }
+
+    .window {
+      width: min(980px, 100%);
+      height: min(760px, 92vh);
+      border: 1px solid var(--line);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      background: #050505;
+    }
+
+    .title {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .screen {
+      margin: 0;
+      padding: 12px 10px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow: auto;
+      line-height: 1.35;
+      font-size: 14px;
+    }
+
+    .bar {
+      border-top: 1px solid var(--line);
+      padding: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      background: #0a0a0a;
+    }
+
+    .prompt {
+      color: var(--accent);
+      font-size: 13px;
+      margin-right: 4px;
+    }
+
+    input[type="file"], input[type="text"], button {
+      background: #111;
+      color: var(--fg);
+      border: 1px solid #333;
+      padding: 7px 8px;
+      font-family: inherit;
+      font-size: 12px;
+    }
+
+    input[type="text"] {
+      min-width: 180px;
+    }
+
+    button {
+      cursor: pointer;
+      min-width: 72px;
+    }
+
+    button:hover {
+      border-color: #666;
+    }
+  </style>
+</head>
+<body>
+  <main class="window">
+    <div class="title" id="title">runner - booting...</div>
+    <pre id="screen" class="screen"></pre>
+    <div class="bar">
+      <span class="prompt">PS C:\erago&gt;</span>
+      <input id="files" type="file" multiple webkitdirectory directory />
+      <input id="inputLine" type="text" placeholder="queue input" />
+      <button id="enqueueBtn">Add</button>
+      <button id="runBtn">Run</button>
+      <button id="clearBtn">Clear</button>
+      <span id="queueInfo" style="color:#9a9a9a;font-size:12px;">queue: 0</span>
+    </div>
+  </main>
+
+  <script src="./wasm_exec.js"></script>
+  <script>
+    const go = new Go();
+    const screen = document.getElementById("screen");
+    const title = document.getElementById("title");
+    const filesEl = document.getElementById("files");
+    const inputLineEl = document.getElementById("inputLine");
+    const enqueueBtn = document.getElementById("enqueueBtn");
+    const runBtn = document.getElementById("runBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const queueInfo = document.getElementById("queueInfo");
+
+    let ready = false;
+    const inputQueue = [];
+
+    function writeLine(text) {
+      screen.textContent += text + "\n";
+      screen.scrollTop = screen.scrollHeight;
+    }
+
+    function setTitle(text) {
+      title.textContent = text;
+    }
+
+    function refreshQueueInfo() {
+      queueInfo.textContent = "queue: " + inputQueue.length;
+    }
+
+    function enqueueInput() {
+      const value = inputLineEl.value.trim();
+      if (!value) return;
+      inputQueue.push(value);
+      inputLineEl.value = "";
+      refreshQueueInfo();
+      writeLine("queued> " + value);
+    }
+
+    async function loadFilesAsMap(fileList) {
+      const map = {};
+      for (const f of fileList) {
+        const text = await f.text();
+        const rel = (f.webkitRelativePath && f.webkitRelativePath.length > 0)
+          ? f.webkitRelativePath
+          : f.name;
+        map[rel] = text;
+      }
+      return map;
+    }
+
+    async function boot() {
+      writeLine("PS C:\\erago> loading wasm...");
+      const resp = await fetch("./erago.wasm");
+      const bytes = await resp.arrayBuffer();
+      const { instance } = await WebAssembly.instantiate(bytes, go.importObject);
+      go.run(instance);
+      ready = true;
+      setTitle("runner - ready");
+      writeLine("PS C:\\erago> ready");
+      writeLine("Select game folder, queue inputs, then press Run.");
+    }
+
+    // Called synchronously from Go/wasm input provider.
+    // Returns next queued input, timeout sentinel, default value, or empty string.
+    window.eragoInputNext = function(reqJSON) {
+      let req = {};
+      try {
+        req = JSON.parse(reqJSON || "{}");
+      } catch (_) {
+        req = {};
+      }
+
+      const cmd = String(req.command || "").toUpperCase();
+      if (inputQueue.length > 0) {
+        const next = inputQueue.shift();
+        refreshQueueInfo();
+        writeLine("input> " + next + " [" + cmd + "]");
+        return next;
+      }
+
+      if (req.timed) {
+        writeLine("input> <timeout> [" + cmd + "]");
+        return "__ERAGO_TIMEOUT__";
+      }
+      if (cmd === "WAIT" || cmd === "WAITANYKEY" || cmd === "FORCEWAIT" || cmd === "TWAIT" || cmd === "AWAIT") {
+        writeLine("input> <continue> [" + cmd + "]");
+        return "";
+      }
+      writeLine("input> <queue empty> [" + cmd + "]");
+      writeLine("hint> add input values, then run again");
+      return "__ERAGO_ABORT__";
+    };
+
+    async function runGame() {
+      if (!ready) {
+        writeLine("PS C:\\erago> error: wasm not ready");
+        return;
+      }
+
+      const files = filesEl.files;
+      if (!files || files.length === 0) {
+        writeLine("PS C:\\erago> error: select folder first");
+        return;
+      }
+
+      writeLine("");
+      writeLine("PS C:\\erago> run TITLE (savefmt=json)");
+      setTitle("runner - running");
+
+      try {
+        const fileMap = await loadFilesAsMap(files);
+        const raw = window.eragoRun(JSON.stringify(fileMap), "TITLE", "json", "[]");
+        const result = JSON.parse(raw);
+
+        if (result.error) {
+          writeLine("runtime error: " + result.error);
+          setTitle("runner - failed");
+          return;
+        }
+
+        let inline = "";
+        for (const o of result.outputs || []) {
+          const text = o.Text ?? o.text ?? "";
+          const nl = o.NewLine ?? o.new_line ?? false;
+          if (nl) {
+            writeLine(inline + text);
+            inline = "";
+          } else {
+            inline += text;
+          }
+        }
+        if (inline.length > 0) {
+          screen.textContent += inline;
+        }
+        screen.scrollTop = screen.scrollHeight;
+        setTitle("runner - done");
+      } catch (e) {
+        writeLine("runtime error: " + e);
+        setTitle("runner - failed");
+      }
+    }
+
+    runBtn.addEventListener("click", runGame);
+    enqueueBtn.addEventListener("click", enqueueInput);
+    clearBtn.addEventListener("click", () => {
+      screen.textContent = "";
+      writeLine("PS C:\\erago> screen cleared");
+    });
+    inputLineEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        enqueueInput();
+      }
+    });
+
+    boot().catch((e) => {
+      writeLine("boot error: " + e);
+      setTitle("runner - boot failed");
+    });
+  </script>
+</body>
+</html>
