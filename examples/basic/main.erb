@@ -1,0 +1,18 @@
+@TITLE
+PRINTL "== erago demo =="
+A = 1
+CALL HELLO(A)
+IF A == 1
+    PRINTL "A is one"
+ELSE
+    PRINTL "A is not one"
+ENDIF
+BEGIN NEXT
+
+@HELLO(ARG)
+PRINTL "HELLO called"
+RETURN
+
+@NEXT
+PRINTL "Moved by BEGIN NEXT"
+QUIT
