@@ -2,9 +2,10 @@ package eruntime
 
 import (
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/rand"
-	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,19 +21,28 @@ type Output struct {
 }
 
 type VM struct {
-	program    *ast.Program
-	globals    map[string]Value
-	gArrays    map[string]*ArrayVar
-	gRefDecl   map[string]bool
-	gRefs      map[string]ast.VarRef
-	stack      []*frame
-	outputs    []Output
-	rng        *rand.Rand
-	csv        *CSVStore
-	saveDir    string
-	ui         UIState
-	characters []RuntimeCharacter
-	nextCharID int64
+	program        *ast.Program
+	globals        map[string]Value
+	gArrays        map[string]*ArrayVar
+	gRefDecl       map[string]bool
+	gRefs          map[string]ast.VarRef
+	stack          []*frame
+	outputs        []Output
+	rng            *rand.Rand
+	csv            *CSVStore
+	saveDir        string
+	ui             UIState
+	characters     []RuntimeCharacter
+	nextCharID     int64
+	flowMap        map[*ast.Thunk]*thunkFlow
+	execThunk      *ast.Thunk
+	execPC         int
+	input          InputState
+	saveUniqueCode int64
+	saveVersion    int64
+	datSaveFormat  string
+	outputHook     func(Output)
+	inputProvider  func(InputRequest) (string, bool, error)
 }
 
 type frame struct {
@@ -48,6 +58,7 @@ type resultKind int
 const (
 	resultNone resultKind = iota
 	resultGoto
+	resultJumpIndex
 	resultBegin
 	resultReturn
 	resultQuit
@@ -57,6 +68,7 @@ const (
 
 type execResult struct {
 	kind    resultKind
+	index   int
 	label   string
 	keyword string
 	values  []Value
@@ -64,23 +76,34 @@ type execResult struct {
 
 func New(program *ast.Program) (*VM, error) {
 	vm := &VM{
-		program:    program,
-		globals:    map[string]Value{},
-		gArrays:    map[string]*ArrayVar{},
-		gRefDecl:   map[string]bool{},
-		gRefs:      map[string]ast.VarRef{},
-		stack:      nil,
-		outputs:    nil,
-		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
-		csv:        newCSVStore(program.CSVFiles),
-		saveDir:    filepath.Join(".", ".erago_saves"),
-		ui:         defaultUIState(),
-		characters: nil,
-		nextCharID: 0,
+		program:        program,
+		globals:        map[string]Value{},
+		gArrays:        map[string]*ArrayVar{},
+		gRefDecl:       map[string]bool{},
+		gRefs:          map[string]ast.VarRef{},
+		stack:          nil,
+		outputs:        nil,
+		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
+		csv:            newCSVStore(program.CSVFiles),
+		saveDir:        "",
+		ui:             defaultUIState(),
+		characters:     nil,
+		nextCharID:     0,
+		flowMap:        map[*ast.Thunk]*thunkFlow{},
+		execThunk:      nil,
+		execPC:         -1,
+		input:          defaultInputState(),
+		saveUniqueCode: 0,
+		saveVersion:    1,
+		datSaveFormat:  "json",
+		outputHook:     nil,
+		inputProvider:  nil,
 	}
+	vm.initSaveIdentity()
 	if err := vm.initDefines(); err != nil {
 		return nil, err
 	}
+	vm.buildFlowIndex()
 	return vm, nil
 }
 
@@ -122,11 +145,50 @@ func (vm *VM) initDefines() error {
 	return nil
 }
 
+func (vm *VM) initSaveIdentity() {
+	code, version, hasCode, hasVersion := vm.csv.GameCodeVersion()
+	if hasCode {
+		vm.saveUniqueCode = code
+	} else {
+		h := fnv.New64a()
+		keys := make([]string, 0, len(vm.program.Functions))
+		for name := range vm.program.Functions {
+			keys = append(keys, name)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			_, _ = h.Write([]byte(k))
+			fn := vm.program.Functions[k]
+			if fn == nil || fn.Body == nil {
+				continue
+			}
+			for _, st := range fn.Body.Statements {
+				switch s := st.(type) {
+				case ast.CommandStmt:
+					_, _ = h.Write([]byte(strings.ToUpper(strings.TrimSpace(s.Name))))
+					_, _ = h.Write([]byte(strings.TrimSpace(s.Arg)))
+				case ast.AssignStmt:
+					_, _ = h.Write([]byte(strings.ToUpper(strings.TrimSpace(s.Target.Name))))
+				}
+			}
+		}
+		vm.saveUniqueCode = int64(h.Sum64() & 0x7fffffffffffffff)
+	}
+	if hasVersion {
+		vm.saveVersion = version
+	} else {
+		vm.saveVersion = 1
+	}
+}
+
 func (vm *VM) Run(entry string) ([]Output, error) {
+	queuedInput := append([]string(nil), vm.input.Queue...)
 	vm.outputs = vm.outputs[:0]
 	vm.ui = defaultUIState()
 	vm.characters = nil
 	vm.nextCharID = 0
+	vm.input = defaultInputState()
+	vm.input.Queue = queuedInput
 	vm.refreshCharacterGlobals()
 	current := strings.ToUpper(strings.TrimSpace(entry))
 	if current == "" {
@@ -161,6 +223,36 @@ func (vm *VM) Globals() map[string]Value {
 
 func (vm *VM) SetSaveDir(dir string) {
 	vm.saveDir = dir
+}
+
+func (vm *VM) SetOutputHook(hook func(Output)) {
+	vm.outputHook = hook
+}
+
+func (vm *VM) SetInputProvider(provider func(InputRequest) (string, bool, error)) {
+	vm.inputProvider = provider
+}
+
+func (vm *VM) SetDatSaveFormat(format string) error {
+	format = strings.ToLower(strings.TrimSpace(format))
+	switch format {
+	case "json", "binary", "both":
+		vm.datSaveFormat = format
+		return nil
+	default:
+		return fmt.Errorf("invalid dat save format %q (use json|binary|both)", format)
+	}
+}
+
+func (vm *VM) DatSaveFormat() string {
+	return vm.datSaveFormat
+}
+
+func (vm *VM) emitOutput(out Output) {
+	vm.outputs = append(vm.outputs, out)
+	if vm.outputHook != nil {
+		vm.outputHook(out)
+	}
 }
 
 func (vm *VM) callFunction(name string, args []Value) (execResult, error) {
@@ -232,7 +324,17 @@ func (vm *VM) callFunction(name string, args []Value) (execResult, error) {
 }
 
 func (vm *VM) runThunk(thunk *ast.Thunk) (execResult, error) {
+	prevThunk := vm.execThunk
+	prevPC := vm.execPC
+	vm.execThunk = thunk
+	vm.execPC = -1
+	defer func() {
+		vm.execThunk = prevThunk
+		vm.execPC = prevPC
+	}()
+
 	for pc := 0; pc < len(thunk.Statements); pc++ {
+		vm.execPC = pc
 		stmt := thunk.Statements[pc]
 		res, err := vm.runStatement(stmt)
 		if err != nil {
@@ -245,6 +347,13 @@ func (vm *VM) runThunk(thunk *ast.Thunk) (execResult, error) {
 				continue
 			}
 			return res, nil
+		}
+		if res.kind == resultJumpIndex {
+			if res.index >= 0 && res.index < len(thunk.Statements) {
+				pc = res.index - 1
+				continue
+			}
+			return execResult{}, fmt.Errorf("invalid jump index %d", res.index)
 		}
 		if res.kind != resultNone {
 			return res, nil
@@ -263,7 +372,7 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 		if err != nil {
 			return execResult{}, err
 		}
-		vm.outputs = append(vm.outputs, Output{Text: v.String(), NewLine: s.NewLine})
+		vm.emitOutput(Output{Text: v.String(), NewLine: s.NewLine})
 		return execResult{kind: resultNone}, nil
 	case ast.AssignStmt:
 		if s.Op == "=" && len(s.Target.Index) == 0 {
@@ -488,7 +597,7 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 		if err != nil {
 			return execResult{}, err
 		}
-		vm.outputs = append(vm.outputs, Output{
+		vm.emitOutput(Output{
 			Text:    text,
 			NewLine: shouldNewlineOnPrint(s.Command),
 		})
@@ -594,20 +703,18 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 			return execResult{}, err
 		}
 		if !vm.ui.SkipDisp {
-			vm.outputs = append(vm.outputs, Output{Text: text, NewLine: shouldNewlineOnPrint(name)})
+			vm.emitOutput(Output{Text: text, NewLine: shouldNewlineOnPrint(name)})
 		}
 		return execResult{kind: resultNone}, nil
 	}
 
 	switch name {
-	case "WAIT", "WAITANYKEY", "FORCEWAIT":
-		return execResult{kind: resultNone}, nil
+	case "WAIT", "WAITANYKEY", "FORCEWAIT", "TWAIT", "AWAIT":
+		return vm.execWaitLike(name, arg)
 	case "INPUT", "ONEINPUT", "TINPUT", "TONEINPUT":
-		vm.globals["RESULT"] = Int(0)
-		return execResult{kind: resultNone}, nil
+		return vm.execInputIntLike(name, arg)
 	case "INPUTS", "ONEINPUTS", "TINPUTS", "TONEINPUTS":
-		vm.globals["RESULT"] = Str("")
-		return execResult{kind: resultNone}, nil
+		return vm.execInputStringLike(name, arg)
 	case "GETTIME":
 		vm.globals["RESULT"] = Int(time.Now().Unix())
 		return execResult{kind: resultNone}, nil
@@ -642,6 +749,12 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 			return execResult{}, err
 		}
 		return execResult{}, fmt.Errorf("THROW: %s", v.String())
+	case "RETURNFORM":
+		text, err := vm.evalPrintForm(arg)
+		if err != nil {
+			return execResult{}, err
+		}
+		return execResult{kind: resultReturn, values: []Value{Str(text)}}, nil
 	case "RETURNF":
 		values, err := vm.evalExprList(arg)
 		if err != nil {
@@ -708,6 +821,10 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 		return vm.execArrayShift(arg)
 	case "ARRAYREMOVE":
 		return vm.execArrayRemove(arg)
+	case "ARRAYCOPY":
+		return vm.execArrayCopy(arg)
+	case "ARRAYSORT":
+		return vm.execArraySort(arg)
 	case "DRAWLINE", "CUSTOMDRAWLINE", "DRAWLINEFORM":
 		return vm.execDrawLine(name, arg)
 	case "CLEARLINE":
@@ -728,7 +845,7 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 			vm.globals["RESULT"] = Int(0)
 		}
 		return execResult{kind: resultNone}, nil
-	case "SKIPDISP", "MOUSESKIP":
+	case "SKIPDISP", "MOUSESKIP", "NOSKIP", "ENDNOSKIP":
 		return vm.execSkipDisp(arg)
 	case "ISSKIP":
 		if vm.ui.SkipDisp {
@@ -786,7 +903,7 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 		return vm.execFontStyle(arg)
 	case "PRINTCPERLINE":
 		return vm.execPrintCPerLine(arg)
-	case "ADDCHARA", "ADDDEFCHARA", "ADDVOIDCHARA":
+	case "ADDCHARA", "ADDDEFCHARA", "ADDVOIDCHARA", "ADDSPCHARA":
 		return vm.execAddChara(arg)
 	case "DELCHARA":
 		return vm.execDelChara(arg)
@@ -819,31 +936,64 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 	case "MOUSEX", "MOUSEY":
 		vm.globals["RESULT"] = Int(0)
 		return execResult{kind: resultNone}, nil
-	case "OUTPUTLOG":
+	case "OUTPUTLOG", "SAVENOS":
 		vm.globals["RESULT"] = Int(1)
 		return execResult{kind: resultNone}, nil
 	case "DEBUGCLEAR":
 		vm.outputs = vm.outputs[:0]
 		vm.globals["RESULT"] = Int(1)
 		return execResult{kind: resultNone}, nil
+	case "ASSERT":
+		if strings.TrimSpace(arg) == "" {
+			return execResult{}, fmt.Errorf("ASSERT without expression")
+		}
+		v, err := vm.evalLooseExpr(arg)
+		if err != nil {
+			return execResult{}, err
+		}
+		if !v.Truthy() {
+			return execResult{}, fmt.Errorf("ASSERT failed")
+		}
+		vm.globals["RESULT"] = Int(1)
+		return execResult{kind: resultNone}, nil
+	case "REF", "REFBYNAME":
+		return vm.execRefBinding(name, arg)
 	case "RESETGLOBAL":
 		return vm.execResetGlobal()
 	case "RESETDATA":
 		return vm.execResetData()
-	case "RESET_STAIN", "STOPCALLTRAIN", "CBGCLEAR", "CBGCLEARBUTTON", "CBGREMOVEBMAP", "CLEARTEXTBOX", "UPCHECK", "CUPCHECK":
+	case "CATCH":
+		if endIdx, ok := vm.currentCatchEndIndex(); ok {
+			vm.globals["RESULT"] = Int(1)
+			return execResult{kind: resultJumpIndex, index: endIdx}, nil
+		}
 		vm.globals["RESULT"] = Int(1)
 		return execResult{kind: resultNone}, nil
+	case "ENDCATCH", "FUNC", "ENDFUNC":
+		vm.globals["RESULT"] = Int(1)
+		return execResult{kind: resultNone}, nil
+	case "RESET_STAIN", "STOPCALLTRAIN", "CBGCLEAR", "CBGCLEARBUTTON", "CBGREMOVEBMAP", "CLEARTEXTBOX", "UPCHECK", "CUPCHECK", "DOTRAIN", "FORCEKANA", "HTML_PRINT", "HTML_TAGSPLIT", "INPUTMOUSEKEY", "TOOLTIP_SETCOLOR", "TOOLTIP_SETDELAY", "TOOLTIP_SETDURATION":
+		vm.globals["RESULT"] = Int(1)
+		return execResult{kind: resultNone}, nil
+	case "SAVEVAR":
+		return vm.execSaveVar(arg)
+	case "LOADVAR":
+		return vm.execLoadVar(arg)
+	case "SAVECHARA":
+		return vm.execSaveChara(arg)
+	case "LOADCHARA":
+		return vm.execLoadChara(arg)
 	case "GOTO", "GOTOFORM", "TRYGOTO", "TRYGOTOFORM", "TRYCGOTO", "TRYCGOTOFORM":
 		label, err := vm.evalCommandTarget(arg, strings.Contains(name, "FORM"))
 		if err != nil {
 			if strings.HasPrefix(name, "TRY") {
-				return execResult{kind: resultNone}, nil
+				return vm.handleTryFailure(name)
 			}
 			return execResult{}, err
 		}
 		if label == "" {
 			if strings.HasPrefix(name, "TRY") {
-				return execResult{kind: resultNone}, nil
+				return vm.handleTryFailure(name)
 			}
 			return execResult{}, fmt.Errorf("%s without target", name)
 		}
@@ -851,7 +1001,7 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 			fr := vm.currentFrame()
 			if fr != nil {
 				if _, ok := fr.fn.Body.LabelMap[strings.ToUpper(label)]; !ok {
-					return execResult{kind: resultNone}, nil
+					return vm.handleTryFailure(name)
 				}
 			}
 		}
@@ -879,23 +1029,27 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 		target, args, err := vm.parseCommandCall(arg, dynamic)
 		if err != nil {
 			if strings.HasPrefix(name, "TRY") {
-				return execResult{kind: resultNone}, nil
+				return vm.handleTryFailure(name)
 			}
 			return execResult{}, err
 		}
 		if target == "" {
 			if strings.HasPrefix(name, "TRY") {
-				return execResult{kind: resultNone}, nil
+				return vm.handleTryFailure(name)
 			}
 			return execResult{}, fmt.Errorf("%s without target", name)
 		}
 		if vm.program.Functions[target] == nil {
 			if strings.HasPrefix(name, "TRY") {
-				return execResult{kind: resultNone}, nil
+				return vm.handleTryFailure(name)
 			}
 			return execResult{}, fmt.Errorf("function %s not found", target)
 		}
 		return vm.callFunction(target, args)
+	}
+
+	if isAny(name, "TRYCALLLIST", "TRYJUMPLIST", "TRYGOTOLIST", "CALLEVENT") {
+		return vm.execCallListLike(name, arg)
 	}
 
 	return execResult{kind: resultNone}, nil
@@ -1339,7 +1493,7 @@ func (vm *VM) execBar(name, arg string) (execResult, error) {
 	}
 	text := "[" + strings.Repeat("*", int(filled)) + strings.Repeat(".", int(length-filled)) + "]"
 	if !vm.ui.SkipDisp {
-		vm.outputs = append(vm.outputs, Output{Text: text, NewLine: name == "BARL"})
+		vm.emitOutput(Output{Text: text, NewLine: name == "BARL"})
 	}
 	vm.globals["RESULTS"] = Str(text)
 	return execResult{kind: resultNone}, nil
@@ -1490,6 +1644,93 @@ func (vm *VM) execArrayRemove(arg string) (execResult, error) {
 	return execResult{kind: resultNone}, nil
 }
 
+func (vm *VM) execArrayCopy(arg string) (execResult, error) {
+	parts := splitTopLevelRuntime(arg, ',')
+	if len(parts) < 2 {
+		parts = strings.Fields(arg)
+	}
+	if len(parts) < 2 {
+		return execResult{}, fmt.Errorf("ARRAYCOPY requires destination and source")
+	}
+	dstRef, err := vm.parseVarRefRuntime(parts[0])
+	if err != nil {
+		return execResult{}, err
+	}
+	srcRef, err := vm.parseVarRefRuntime(parts[1])
+	if err != nil {
+		return execResult{}, err
+	}
+	if len(dstRef.Index) != 0 || len(srcRef.Index) != 0 {
+		return execResult{}, fmt.Errorf("ARRAYCOPY expects base array variables")
+	}
+	src, ok := vm.lookupArray(strings.ToUpper(srcRef.Name))
+	if !ok {
+		return execResult{}, fmt.Errorf("ARRAYCOPY source is not an array")
+	}
+	dstName := strings.ToUpper(dstRef.Name)
+	dst, ok := vm.lookupArray(dstName)
+	if !ok {
+		dst = newArrayVar(src.IsString, src.IsDynamic, src.Dims)
+		if fr := vm.currentFrame(); fr != nil {
+			if _, exists := fr.lArrays[dstName]; exists {
+				fr.lArrays[dstName] = dst
+			} else {
+				vm.gArrays[dstName] = dst
+			}
+		} else {
+			vm.gArrays[dstName] = dst
+		}
+	}
+	dst.IsString = src.IsString
+	dst.IsDynamic = src.IsDynamic
+	dst.Dims = append(dst.Dims[:0], src.Dims...)
+	dst.Data = map[string]Value{}
+	for k, v := range src.Data {
+		dst.Data[k] = v
+	}
+	vm.globals["RESULT"] = Int(1)
+	return execResult{kind: resultNone}, nil
+}
+
+func (vm *VM) execArraySort(arg string) (execResult, error) {
+	ref, err := vm.parseVarRefRuntime(arg)
+	if err != nil {
+		return execResult{}, err
+	}
+	if len(ref.Index) != 0 {
+		return execResult{}, fmt.Errorf("ARRAYSORT expects base array variable")
+	}
+	arr, ok := vm.lookupArray(strings.ToUpper(ref.Name))
+	if !ok {
+		return execResult{}, fmt.Errorf("ARRAYSORT target is not an array")
+	}
+	if len(arr.Dims) == 0 {
+		vm.globals["RESULT"] = Int(0)
+		return execResult{kind: resultNone}, nil
+	}
+	n := arr.Dims[0]
+	if n <= 1 {
+		vm.globals["RESULT"] = Int(1)
+		return execResult{kind: resultNone}, nil
+	}
+	vals := make([]Value, n)
+	for i := 0; i < n; i++ {
+		v, _ := arr.Get([]int64{int64(i)})
+		vals[i] = v
+	}
+	sort.Slice(vals, func(i, j int) bool {
+		if arr.IsString {
+			return vals[i].String() < vals[j].String()
+		}
+		return vals[i].Int64() < vals[j].Int64()
+	})
+	for i := 0; i < n; i++ {
+		_ = arr.Set([]int64{int64(i)}, vals[i])
+	}
+	vm.globals["RESULT"] = Int(1)
+	return execResult{kind: resultNone}, nil
+}
+
 func (vm *VM) execDrawLine(name, arg string) (execResult, error) {
 	text := strings.Repeat("-", 40)
 	if strings.Contains(name, "FORM") {
@@ -1503,7 +1744,7 @@ func (vm *VM) execDrawLine(name, arg string) (execResult, error) {
 			text = v.String()
 		}
 	}
-	vm.outputs = append(vm.outputs, Output{Text: text, NewLine: true})
+	vm.emitOutput(Output{Text: text, NewLine: true})
 	return execResult{kind: resultNone}, nil
 }
 
@@ -1527,7 +1768,7 @@ func (vm *VM) execReuseLastLine() (execResult, error) {
 		return execResult{kind: resultNone}, nil
 	}
 	last := vm.outputs[len(vm.outputs)-1]
-	vm.outputs = append(vm.outputs, last)
+	vm.emitOutput(last)
 	return execResult{kind: resultNone}, nil
 }
 
@@ -1785,12 +2026,82 @@ func (vm *VM) lookupArray(name string) (*ArrayVar, bool) {
 	return arr, ok
 }
 
+func (vm *VM) execRefBinding(name, arg string) (execResult, error) {
+	parts := splitTopLevelRuntime(arg, ',')
+	if len(parts) < 2 {
+		parts = strings.Fields(arg)
+	}
+	if len(parts) < 2 {
+		return execResult{}, fmt.Errorf("%s requires destination and source", name)
+	}
+	dst, err := vm.parseVarRefRuntime(parts[0])
+	if err != nil {
+		return execResult{}, err
+	}
+	if len(dst.Index) != 0 {
+		return execResult{}, fmt.Errorf("%s destination must be a base variable", name)
+	}
+	var src ast.VarRef
+	if name == "REFBYNAME" {
+		v, err := vm.evalLooseExpr(parts[1])
+		if err != nil {
+			return execResult{}, err
+		}
+		src, err = vm.parseVarRefRuntime(v.String())
+		if err != nil {
+			return execResult{}, err
+		}
+	} else {
+		src, err = vm.parseVarRefRuntime(parts[1])
+		if err != nil {
+			return execResult{}, err
+		}
+	}
+	if !vm.isRefDeclared(dst.Name) {
+		vm.globals["RESULT"] = Int(0)
+		return execResult{kind: resultNone}, nil
+	}
+	vm.setRefBinding(strings.ToUpper(dst.Name), src)
+	vm.globals["RESULT"] = Int(1)
+	return execResult{kind: resultNone}, nil
+}
+
 func (vm *VM) execMethodLike(name, arg string) (Value, bool, error) {
 	args, err := vm.evalCommandArgs(arg)
 	if err != nil {
 		return Value{}, false, err
 	}
 	switch name {
+	case "SUMARRAY", "SUMCARRAY":
+		return vm.execMethodSumArray(arg), true, nil
+	case "MATCH", "CMATCH":
+		return vm.execMethodMatch(arg), true, nil
+	case "GROUPMATCH":
+		return vm.execMethodGroupMatch(args), true, nil
+	case "NOSAMES":
+		return vm.execMethodNoSames(args), true, nil
+	case "ALLSAMES":
+		return vm.execMethodAllSames(args), true, nil
+	case "MAXARRAY", "MAXCARRAY":
+		return vm.execMethodMaxMinArray(arg, true), true, nil
+	case "MINARRAY", "MINCARRAY":
+		return vm.execMethodMaxMinArray(arg, false), true, nil
+	case "GETNUM":
+		return vm.execMethodGetNum(arg, false), true, nil
+	case "GETNUMB":
+		return vm.execMethodGetNum(arg, true), true, nil
+	case "FINDELEMENT":
+		return vm.execMethodFindElement(arg, false), true, nil
+	case "FINDLASTELEMENT":
+		return vm.execMethodFindElement(arg, true), true, nil
+	case "INRANGEARRAY", "INRANGECARRAY":
+		return vm.execMethodInRangeArray(arg), true, nil
+	case "VARSIZE":
+		n, err := vm.evalVarSizeRaw(arg)
+		if err != nil {
+			return Value{}, true, err
+		}
+		return Int(n), true, nil
 	case "UNICODE":
 		if len(args) < 1 {
 			return Str(""), true, nil
@@ -1986,6 +2297,97 @@ func (vm *VM) execMethodLike(name, arg string) (Value, bool, error) {
 			return Str(""), true, nil
 		}
 		return Str(args[0].String()), true, nil
+	case "TOUPPER":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		return Str(strings.ToUpper(args[0].String())), true, nil
+	case "TOLOWER":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		return Str(strings.ToLower(args[0].String())), true, nil
+	case "TOHALF":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		return Str(toHalfWidth(args[0].String())), true, nil
+	case "TOFULL":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		return Str(toFullWidth(args[0].String())), true, nil
+	case "REPLACE":
+		if len(args) < 3 {
+			return Str(""), true, nil
+		}
+		return Str(strings.ReplaceAll(args[0].String(), args[1].String(), args[2].String())), true, nil
+	case "STRCOUNT":
+		if len(args) < 2 {
+			return Int(0), true, nil
+		}
+		return Int(int64(strings.Count(args[0].String(), args[1].String()))), true, nil
+	case "STRJOIN":
+		if len(args) < 2 {
+			if len(args) == 1 {
+				return Str(args[0].String()), true, nil
+			}
+			return Str(""), true, nil
+		}
+		sep := args[0].String()
+		parts := make([]string, 0, len(args)-1)
+		for _, a := range args[1:] {
+			parts = append(parts, a.String())
+		}
+		return Str(strings.Join(parts, sep)), true, nil
+	case "STRFORM":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		out := args[0].String()
+		out, err = vm.evalPercentPlaceholders(out)
+		if err != nil {
+			return Value{}, true, err
+		}
+		out, err = vm.evalBracePlaceholders(out)
+		if err != nil {
+			return Value{}, true, err
+		}
+		return Str(out), true, nil
+	case "CHARATU":
+		if len(args) < 2 {
+			return Str(""), true, nil
+		}
+		r := []rune(args[0].String())
+		idx := args[1].Int64()
+		if idx < 0 || idx >= int64(len(r)) {
+			return Str(""), true, nil
+		}
+		return Str(string(r[idx])), true, nil
+	case "CONVERT":
+		if len(args) < 2 {
+			return Str(""), true, nil
+		}
+		base := args[1].Int64()
+		if base != 2 && base != 8 && base != 10 && base != 16 {
+			return Value{}, true, fmt.Errorf("CONVERT base must be one of 2,8,10,16")
+		}
+		return Str(strconv.FormatInt(args[0].Int64(), int(base))), true, nil
+	case "ISNUMERIC":
+		if len(args) < 1 {
+			return Int(0), true, nil
+		}
+		if isNumericLike(args[0].String()) {
+			return Int(1), true, nil
+		}
+		return Int(0), true, nil
+	case "GETTIMES":
+		return Str(time.Now().Format("2006/01/02 15:04:05")), true, nil
+	case "MONEYSTR":
+		if len(args) < 1 {
+			return Str("0"), true, nil
+		}
+		return Str(strconv.FormatInt(args[0].Int64(), 10)), true, nil
 	case "EXISTCSV":
 		if len(args) < 1 {
 			return Int(0), true, nil
@@ -2013,6 +2415,418 @@ func (vm *VM) execMethodLike(name, arg string) (Value, bool, error) {
 	default:
 		return Value{}, false, nil
 	}
+}
+
+func (vm *VM) execMethodSumArray(arg string) Value {
+	ref, parts, ok := vm.methodArrayRefAndParts(arg, 1)
+	if !ok {
+		return Int(0)
+	}
+	arr, ok := vm.lookupArray(strings.ToUpper(ref.Name))
+	if !ok || len(arr.Dims) == 0 {
+		return Int(0)
+	}
+	start, end := vm.parseArrayRange(arr.Dims[0], parts, 1, 2)
+	sum := int64(0)
+	for i := start; i < end; i++ {
+		v, _ := arr.Get([]int64{i})
+		sum += v.Int64()
+	}
+	return Int(sum)
+}
+
+func (vm *VM) execMethodMatch(arg string) Value {
+	ref, parts, ok := vm.methodArrayRefAndParts(arg, 2)
+	if !ok {
+		return Int(0)
+	}
+	arr, ok := vm.lookupArray(strings.ToUpper(ref.Name))
+	if !ok || len(arr.Dims) == 0 {
+		return Int(0)
+	}
+	target, err := vm.evalLooseExpr(parts[1])
+	if err != nil {
+		return Int(0)
+	}
+	start, end := vm.parseArrayRange(arr.Dims[0], parts, 2, 3)
+	count := int64(0)
+	for i := start; i < end; i++ {
+		v, _ := arr.Get([]int64{i})
+		if valueEqual(v, target) {
+			count++
+		}
+	}
+	return Int(count)
+}
+
+func (vm *VM) execMethodGroupMatch(args []Value) Value {
+	if len(args) < 2 {
+		return Int(0)
+	}
+	base := args[0]
+	count := int64(0)
+	for _, v := range args[1:] {
+		if valueEqual(base, v) {
+			count++
+		}
+	}
+	return Int(count)
+}
+
+func (vm *VM) execMethodNoSames(args []Value) Value {
+	if len(args) < 2 {
+		return Int(1)
+	}
+	base := args[0]
+	for _, v := range args[1:] {
+		if valueEqual(base, v) {
+			return Int(0)
+		}
+	}
+	return Int(1)
+}
+
+func (vm *VM) execMethodAllSames(args []Value) Value {
+	if len(args) < 2 {
+		return Int(1)
+	}
+	base := args[0]
+	for _, v := range args[1:] {
+		if !valueEqual(base, v) {
+			return Int(0)
+		}
+	}
+	return Int(1)
+}
+
+func (vm *VM) execMethodMaxMinArray(arg string, isMax bool) Value {
+	ref, parts, ok := vm.methodArrayRefAndParts(arg, 1)
+	if !ok {
+		return Int(0)
+	}
+	arr, ok := vm.lookupArray(strings.ToUpper(ref.Name))
+	if !ok || len(arr.Dims) == 0 {
+		return Int(0)
+	}
+	start, end := vm.parseArrayRange(arr.Dims[0], parts, 1, 2)
+	if start >= end {
+		return Int(0)
+	}
+	first, _ := arr.Get([]int64{start})
+	best := first.Int64()
+	for i := start + 1; i < end; i++ {
+		v, _ := arr.Get([]int64{i})
+		n := v.Int64()
+		if isMax {
+			if n > best {
+				best = n
+			}
+		} else if n < best {
+			best = n
+		}
+	}
+	return Int(best)
+}
+
+func (vm *VM) execMethodGetNum(arg string, byName bool) Value {
+	parts := splitTopLevelRuntime(arg, ',')
+	if len(parts) < 2 {
+		return Int(-1)
+	}
+	varName := ""
+	if byName {
+		v, err := vm.evalLooseExpr(parts[0])
+		if err != nil {
+			return Int(-1)
+		}
+		varName = strings.ToUpper(strings.TrimSpace(v.String()))
+	} else {
+		ref, err := vm.parseVarRefRuntime(parts[0])
+		if err != nil {
+			return Int(-1)
+		}
+		varName = strings.ToUpper(strings.TrimSpace(ref.Name))
+	}
+	keyV, err := vm.evalLooseExpr(parts[1])
+	if err != nil {
+		return Int(-1)
+	}
+	base := csvBaseFromVarName(varName)
+	if base == "" {
+		base = varName
+	}
+	id, ok := vm.csv.FindID(base, keyV.String())
+	if !ok {
+		return Int(-1)
+	}
+	return Int(id)
+}
+
+func (vm *VM) execMethodFindElement(arg string, last bool) Value {
+	ref, parts, ok := vm.methodArrayRefAndParts(arg, 2)
+	if !ok {
+		return Int(-1)
+	}
+	arr, ok := vm.lookupArray(strings.ToUpper(ref.Name))
+	if !ok || len(arr.Dims) == 0 {
+		return Int(-1)
+	}
+	target, err := vm.evalLooseExpr(parts[1])
+	if err != nil {
+		return Int(-1)
+	}
+	start, end := vm.parseArrayRange(arr.Dims[0], parts, 2, 3)
+	exact := false
+	if len(parts) > 4 && strings.TrimSpace(parts[4]) != "" {
+		v, err := vm.evalLooseExpr(parts[4])
+		if err == nil {
+			exact = v.Truthy()
+		}
+	}
+	var re *regexp.Regexp
+	if target.Kind() == StringKind && !exact {
+		pat := target.String()
+		rx, err := regexp.Compile(pat)
+		if err == nil {
+			re = rx
+		}
+	}
+	if last {
+		for i := end - 1; i >= start; i-- {
+			v, _ := arr.Get([]int64{i})
+			if methodElementMatches(v, target, exact, re) {
+				return Int(i)
+			}
+		}
+		return Int(-1)
+	}
+	for i := start; i < end; i++ {
+		v, _ := arr.Get([]int64{i})
+		if methodElementMatches(v, target, exact, re) {
+			return Int(i)
+		}
+	}
+	return Int(-1)
+}
+
+func (vm *VM) execMethodInRangeArray(arg string) Value {
+	ref, parts, ok := vm.methodArrayRefAndParts(arg, 3)
+	if !ok {
+		return Int(0)
+	}
+	arr, ok := vm.lookupArray(strings.ToUpper(ref.Name))
+	if !ok || len(arr.Dims) == 0 {
+		return Int(0)
+	}
+	minV, err := vm.evalLooseExpr(parts[1])
+	if err != nil {
+		return Int(0)
+	}
+	maxV, err := vm.evalLooseExpr(parts[2])
+	if err != nil {
+		return Int(0)
+	}
+	start, end := vm.parseArrayRange(arr.Dims[0], parts, 3, 4)
+	count := int64(0)
+	lo, hi := minV.Int64(), maxV.Int64()
+	for i := start; i < end; i++ {
+		v, _ := arr.Get([]int64{i})
+		n := v.Int64()
+		if n >= lo && n <= hi {
+			count++
+		}
+	}
+	return Int(count)
+}
+
+func (vm *VM) methodArrayRefAndParts(arg string, minParts int) (ast.VarRef, []string, bool) {
+	parts := splitTopLevelRuntime(arg, ',')
+	if len(parts) < minParts {
+		return ast.VarRef{}, nil, false
+	}
+	ref, err := vm.parseVarRefRuntime(parts[0])
+	if err != nil {
+		return ast.VarRef{}, nil, false
+	}
+	if len(ref.Index) != 0 {
+		return ast.VarRef{}, nil, false
+	}
+	return ref, parts, true
+}
+
+func (vm *VM) parseArrayRange(length int, parts []string, startPart, endPart int) (int64, int64) {
+	n := int64(length)
+	start := int64(0)
+	end := n
+	if startPart < len(parts) && strings.TrimSpace(parts[startPart]) != "" {
+		if v, err := vm.evalLooseExpr(parts[startPart]); err == nil {
+			start = v.Int64()
+		}
+	}
+	if endPart < len(parts) && strings.TrimSpace(parts[endPart]) != "" {
+		if v, err := vm.evalLooseExpr(parts[endPart]); err == nil {
+			end = v.Int64()
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 {
+		end = 0
+	}
+	if start > n {
+		start = n
+	}
+	if end > n {
+		end = n
+	}
+	if end < start {
+		end = start
+	}
+	return start, end
+}
+
+func methodElementMatches(v Value, target Value, exact bool, re *regexp.Regexp) bool {
+	if target.Kind() == StringKind {
+		if exact {
+			return v.String() == target.String()
+		}
+		if re != nil {
+			return re.MatchString(v.String())
+		}
+		return v.String() == target.String()
+	}
+	return v.Int64() == target.Int64()
+}
+
+func csvBaseFromVarName(name string) string {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	switch name {
+	case "ABL", "BASE", "MARK", "EXP", "RELATION", "TALENT", "CFLAG", "EQUIP", "JUEL", "CSTR":
+		return name
+	case "NAME":
+		return "NAME"
+	case "CALLNAME":
+		return "CALLNAME"
+	case "NICKNAME":
+		return "NICKNAME"
+	case "MASTERNAME":
+		return "MASTERNAME"
+	case "ITEM":
+		return "ITEM"
+	case "TRAIN":
+		return "TRAIN"
+	default:
+		return name
+	}
+}
+
+func toHalfWidth(s string) string {
+	runes := []rune(s)
+	for i, r := range runes {
+		switch {
+		case r == '　':
+			runes[i] = ' '
+		case r >= '！' && r <= '～':
+			runes[i] = r - 0xFEE0
+		}
+	}
+	return string(runes)
+}
+
+func toFullWidth(s string) string {
+	runes := []rune(s)
+	for i, r := range runes {
+		switch {
+		case r == ' ':
+			runes[i] = '　'
+		case r >= '!' && r <= '~':
+			runes[i] = r + 0xFEE0
+		}
+	}
+	return string(runes)
+}
+
+func isNumericLike(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	re := regexp.MustCompile(`^[+-]?[0-9]+(\.[0-9]+)?$`)
+	return re.MatchString(s)
+}
+
+func (vm *VM) evalVarSizeRaw(raw string) (int64, error) {
+	parts := splitTopLevelRuntime(raw, ',')
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return 0, nil
+	}
+	ref, err := vm.parseVarRefRuntime(parts[0])
+	if err != nil {
+		return 0, nil
+	}
+	dimIdx := int64(0)
+	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+		v, err := vm.evalLooseExpr(parts[1])
+		if err == nil {
+			dimIdx = v.Int64()
+		}
+	}
+	if arr, ok := vm.lookupArray(strings.ToUpper(ref.Name)); ok {
+		if dimIdx < 0 || int(dimIdx) >= len(arr.Dims) {
+			return 0, nil
+		}
+		return int64(arr.Dims[dimIdx]), nil
+	}
+	if dimIdx == 0 {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+func (vm *VM) execCallListLike(name, arg string) (execResult, error) {
+	if strings.HasPrefix(name, "TRY") {
+		if res, ok, err := vm.execTryListBlock(name); ok || err != nil {
+			return res, err
+		}
+	}
+	parts := splitTopLevelRuntime(arg, ',')
+	if len(parts) == 0 {
+		parts = strings.Fields(arg)
+	}
+	if len(parts) == 0 {
+		return execResult{kind: resultNone}, nil
+	}
+	if name == "CALLEVENT" {
+		target := strings.ToUpper(strings.TrimSpace(parts[0]))
+		if target == "" {
+			return execResult{kind: resultNone}, nil
+		}
+		if vm.program.Functions[target] == nil {
+			return execResult{kind: resultNone}, nil
+		}
+		return vm.callFunction(target, nil)
+	}
+	if name == "TRYGOTOLIST" {
+		fr := vm.currentFrame()
+		for _, p := range parts {
+			label := strings.ToUpper(strings.TrimSpace(p))
+			if fr != nil {
+				if _, ok := fr.fn.Body.LabelMap[label]; ok {
+					return execResult{kind: resultGoto, label: label}, nil
+				}
+			}
+		}
+		return execResult{kind: resultNone}, nil
+	}
+	for _, p := range parts {
+		target := strings.ToUpper(strings.TrimSpace(p))
+		if target == "" || vm.program.Functions[target] == nil {
+			continue
+		}
+		return vm.callFunction(target, nil)
+	}
+	return execResult{kind: resultNone}, nil
 }
 
 func (vm *VM) evalCommandArgs(arg string) ([]Value, error) {

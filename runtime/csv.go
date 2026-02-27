@@ -7,14 +7,20 @@ import (
 )
 
 type CSVStore struct {
-	rowsByBase map[string][][]string
-	nameByBase map[string]map[int64]string
+	rowsByBase     map[string][][]string
+	nameByBase     map[string]map[int64]string
+	gameCode       int64
+	gameVersion    int64
+	hasGameCode    bool
+	hasGameVersion bool
 }
 
 func newCSVStore(files map[string]string) *CSVStore {
 	s := &CSVStore{
-		rowsByBase: map[string][][]string{},
-		nameByBase: map[string]map[int64]string{},
+		rowsByBase:  map[string][][]string{},
+		nameByBase:  map[string]map[int64]string{},
+		gameCode:    0,
+		gameVersion: 0,
 	}
 	for file, content := range files {
 		base := csvBaseName(file)
@@ -23,6 +29,27 @@ func newCSVStore(files map[string]string) *CSVStore {
 		}
 		rows := parseCSVContent(content)
 		s.rowsByBase[base] = rows
+		if base == "GAMEBASE" {
+			for _, row := range rows {
+				if len(row) < 2 {
+					continue
+				}
+				key := strings.TrimSpace(row[0])
+				val := strings.TrimSpace(row[1])
+				switch strings.ToUpper(key) {
+				case "CODE", "コード", "코드":
+					if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+						s.gameCode = n
+						s.hasGameCode = true
+					}
+				case "VERSION", "バージョン", "버전":
+					if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+						s.gameVersion = n
+						s.hasGameVersion = true
+					}
+				}
+			}
+		}
 		nameMap := map[int64]string{}
 		for _, row := range rows {
 			if len(row) < 2 {
@@ -104,4 +131,31 @@ func (s *CSVStore) Exists(base string) bool {
 	base = strings.ToUpper(strings.TrimSpace(base))
 	_, ok := s.rowsByBase[base]
 	return ok
+}
+
+func (s *CSVStore) FindID(base, name string) (int64, bool) {
+	base = strings.ToUpper(strings.TrimSpace(base))
+	rows := s.rowsByBase[base]
+	if len(rows) == 0 {
+		return 0, false
+	}
+	target := strings.TrimSpace(name)
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(row[1]), target) {
+			continue
+		}
+		id, err := strconv.ParseInt(strings.TrimSpace(row[0]), 10, 64)
+		if err != nil {
+			continue
+		}
+		return id, true
+	}
+	return 0, false
+}
+
+func (s *CSVStore) GameCodeVersion() (code int64, version int64, hasCode bool, hasVersion bool) {
+	return s.gameCode, s.gameVersion, s.hasGameCode, s.hasGameVersion
 }

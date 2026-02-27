@@ -1,10 +1,13 @@
 package erago_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gosuda/erago"
 	"github.com/gosuda/erago/parser"
+	eruntime "github.com/gosuda/erago/runtime"
 )
 
 func TestCompileAndRunBasicFlow(t *testing.T) {
@@ -567,5 +570,486 @@ QUIT
 	}
 	if len(out) != 1 || out[0].Text != "b" {
 		t.Fatalf("unexpected DEBUGCLEAR behavior: %+v", out)
+	}
+}
+
+func TestEmueraCompatCommandsBaseline(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERH": `
+#DIM ARR, 4
+#DIM REF R
+`,
+		"MAIN.ERB": `
+@TITLE
+ARR:0 = 3
+ARR:1 = 1
+ARR:2 = 2
+ARRAYSORT ARR
+PRINTVL ARR:0
+ARRAYCOPY BARR, ARR
+VARSIZE BARR, 0
+PRINTVL RESULT
+REF R, ARR:1
+PRINTVL R
+CALL F
+PRINTVL RESULT
+ASSERT 1
+TRYCALLLIST MISSING_A, MISSING_B
+TWAIT
+AWAIT
+QUIT
+
+@F
+RETURNFORM hello {1+1}
+`,
+	}
+
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) != 4 {
+		t.Fatalf("unexpected output count: %d (%+v)", len(out), out)
+	}
+	if out[0].Text != "0" {
+		t.Fatalf("unexpected ARRAYSORT result: %q", out[0].Text)
+	}
+	if out[1].Text != "4" {
+		t.Fatalf("unexpected VARSIZE result: %q", out[1].Text)
+	}
+	if out[2].Text != "1" {
+		t.Fatalf("unexpected REF result: %q", out[2].Text)
+	}
+	if out[3].Text != "hello 2" {
+		t.Fatalf("unexpected RETURNFORM result: %q", out[3].Text)
+	}
+}
+
+func TestEmueraMethodArrayAndStringHelpers(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERH": `
+#DIM ARR, 5
+#DIMS SARR, 4
+`,
+		"MAIN.ERB": `
+@TITLE
+ARR:0 = 1
+ARR:1 = 2
+ARR:2 = 2
+ARR:3 = 5
+SARR:0 = "aa"
+SARR:1 = "bb"
+SARR:2 = "ab"
+
+SUMARRAY ARR
+PRINTVL RESULT
+MATCH ARR, 2
+PRINTVL RESULT
+MAXARRAY ARR
+PRINTVL RESULT
+MINARRAY ARR
+PRINTVL RESULT
+FINDELEMENT ARR, 2
+PRINTVL RESULT
+FINDLASTELEMENT ARR, 2
+PRINTVL RESULT
+INRANGEARRAY ARR, 2, 4
+PRINTVL RESULT
+GROUPMATCH 3, 3, 2, 3
+PRINTVL RESULT
+NOSAMES "a", "b", "a"
+PRINTVL RESULT
+ALLSAMES 7, 7, 7
+PRINTVL RESULT
+REPLACE "a-b-c", "-", "+"
+PRINTVL RESULTS
+STRCOUNT "ababa", "ba"
+PRINTVL RESULT
+STRJOIN "|", "x", "y", "z"
+PRINTVL RESULTS
+STRFORM "A={1+2}"
+PRINTVL RESULTS
+CHARATU "ABC", 1
+PRINTVL RESULTS
+CONVERT 255, 16
+PRINTVL RESULTS
+ISNUMERIC "12.5"
+PRINTVL RESULT
+ISNUMERIC "a12"
+PRINTVL RESULT
+TOFULL "A 1!"
+PRINTVL RESULTS
+TOHALF "Ａ　１！"
+PRINTVL RESULTS
+QUIT
+`,
+	}
+
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) != 20 {
+		t.Fatalf("unexpected output count: %d (%+v)", len(out), out)
+	}
+	expect := []string{
+		"10", "2", "5", "0", "1", "2", "2", "2", "0", "1",
+		"a+b+c", "2", "x|y|z", "A=3", "B", "ff", "1", "0", "Ａ　１！", "A 1!",
+	}
+	for i, exp := range expect {
+		if out[i].Text != exp {
+			t.Fatalf("unexpected output at %d: got=%q want=%q", i, out[i].Text, exp)
+		}
+	}
+}
+
+func TestEmueraMethodGetNum(t *testing.T) {
+	files := map[string]string{
+		"ABL.CSV": "0,힘\n1,민첩\n",
+		"MAIN.ERB": `
+@TITLE
+GETNUM ABL, "민첩"
+PRINTVL RESULT
+GETNUMB "ABL", "힘"
+PRINTVL RESULT
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("unexpected output count: %d (%+v)", len(out), out)
+	}
+	if out[0].Text != "1" || out[1].Text != "0" {
+		t.Fatalf("unexpected GETNUM outputs: %+v", out)
+	}
+}
+
+func TestTryCatchAndFuncEndFuncFlow(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+A = 0
+TRYCGOTO MISSING_LABEL
+A = 1
+CATCH
+A = 2
+ENDCATCH
+PRINTVL A
+
+TRYCCALL UNKNOWN_FUNC
+A = 10
+CATCH
+A = 11
+ENDCATCH
+PRINTVL A
+
+TRYCCALL SET_A2
+A = 100
+CATCH
+A = 101
+ENDCATCH
+PRINTVL A
+
+TRYCALLLIST
+FUNC UNKNOWN1()
+FUNC SET_A()
+ENDFUNC
+PRINTVL A
+
+TRYGOTOLIST
+FUNC NOPE
+FUNC OK
+ENDFUNC
+A = 999
+$OK
+PRINTVL A
+QUIT
+
+@SET_A
+A = 7
+RETURN
+
+@SET_A2
+RETURN
+`,
+	}
+
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) < 5 {
+		t.Fatalf("unexpected output count: %d", len(out))
+	}
+	got := []string{
+		out[len(out)-5].Text,
+		out[len(out)-4].Text,
+		out[len(out)-3].Text,
+		out[len(out)-2].Text,
+		out[len(out)-1].Text,
+	}
+	want := []string{"2", "11", "100", "7", "7"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("unexpected output at %d: got=%q want=%q all=%+v", i, got[i], want[i], out)
+		}
+	}
+}
+
+func TestInputStateMachineAndDefaults(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+INPUT 5
+A = RESULT
+INPUT
+B = RESULT
+INPUTS "abc"
+S = RESULTS
+ONEINPUT 98
+C = RESULT
+TINPUT 10, 42, 1, "timeout"
+D = RESULT
+TINPUTS 10, "xyz", 1, "oops"
+T = RESULTS
+WAIT
+PRINTVL A
+PRINTVL B
+PRINTVL S
+PRINTVL C
+PRINTVL D
+PRINTVL T
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	vm.EnqueueInput("12", "", "", "789")
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) < 6 {
+		t.Fatalf("unexpected output count: %d", len(out))
+	}
+	got := []string{
+		out[len(out)-6].Text,
+		out[len(out)-5].Text,
+		out[len(out)-4].Text,
+		out[len(out)-3].Text,
+		out[len(out)-2].Text,
+		out[len(out)-1].Text,
+	}
+	want := []string{"12", "0", "abc", "7", "42", "xyz"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("unexpected input flow at %d: got=%q want=%q all=%+v", i, got[i], want[i], out)
+		}
+	}
+}
+
+func TestSaveVarLoadVarCompat(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERH": `
+#DIM ARR, 4
+#DIMS SS, 4
+`,
+		"MAIN.ERB": `
+@TITLE
+A = 7
+ARR:1 = 11
+SS:2 = "hi"
+SAVEVAR "case1", "mes", A, ARR, SS
+A = 0
+ARR:1 = 0
+SS:2 = ""
+LOADVAR "case1"
+PRINTVL A
+PRINTVL ARR:1
+PRINTVL SS:2
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	tmp := t.TempDir()
+	vm.SetSaveDir(tmp)
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) != 3 || out[0].Text != "7" || out[1].Text != "11" || out[2].Text != "hi" {
+		t.Fatalf("unexpected SAVEVAR/LOADVAR outputs: %+v", out)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "var_case1.dat")); err != nil {
+		t.Fatalf("expected var save file: %v", err)
+	}
+}
+
+func TestSaveCharaLoadCharaCompat(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+ADDCHARA 101
+ADDCHARA 202
+SAVECHARA "party", "memo", 0
+DELALLCHARA
+LOADCHARA "party"
+PRINTVL CHARANUM
+GETCHARA 0
+PRINTVL RESULT
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	tmp := t.TempDir()
+	vm.SetSaveDir(tmp)
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) != 2 || out[0].Text != "1" || out[1].Text != "101" {
+		t.Fatalf("unexpected SAVECHARA/LOADCHARA outputs: %+v", out)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "chara_party.dat")); err != nil {
+		t.Fatalf("expected chara save file: %v", err)
+	}
+}
+
+func TestSaveVarBinaryMode(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERH": "#DIM ARR, 3\n",
+		"MAIN.ERB": `
+@TITLE
+A = 9
+ARR:1 = 22
+SAVEVAR "bin1", "m"
+A = 0
+ARR:1 = 0
+LOADVAR "bin1"
+PRINTVL A
+PRINTVL ARR:1
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	if err := vm.SetDatSaveFormat("binary"); err != nil {
+		t.Fatalf("set format failed: %v", err)
+	}
+	tmp := t.TempDir()
+	vm.SetSaveDir(tmp)
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) != 2 || out[0].Text != "9" || out[1].Text != "22" {
+		t.Fatalf("unexpected binary save/load outputs: %+v", out)
+	}
+	b, err := os.ReadFile(filepath.Join(tmp, "var_bin1.dat"))
+	if err != nil {
+		t.Fatalf("read dat failed: %v", err)
+	}
+	if !eruntime.IsEraBinaryData(b) {
+		t.Fatalf("expected binary dat format")
+	}
+}
+
+func TestSaveVarBothModeWritesJsonCompanion(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+A = 3
+SAVEVAR "both1", "m"
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	if err := vm.SetDatSaveFormat("both"); err != nil {
+		t.Fatalf("set format failed: %v", err)
+	}
+	tmp := t.TempDir()
+	vm.SetSaveDir(tmp)
+	if _, err := vm.Run("TITLE"); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "var_both1.dat")); err != nil {
+		t.Fatalf("expected binary dat: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "var_both1.json")); err != nil {
+		t.Fatalf("expected json companion: %v", err)
+	}
+}
+
+func TestDatConverterVarJsonBinaryRoundtrip(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERH": "#DIM ARR, 4\n",
+		"MAIN.ERB": `
+@TITLE
+A = 15
+ARR:2 = 88
+SAVEVAR "conv1", "m"
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	tmp := t.TempDir()
+	vm.SetSaveDir(tmp)
+	if _, err := vm.Run("TITLE"); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	jsonDat := filepath.Join(tmp, "var_conv1.dat")
+	binDat := filepath.Join(tmp, "var_conv1_bin.dat")
+	jsonOut := filepath.Join(tmp, "var_conv1_out.json")
+	if err := eruntime.ConvertDatFile("var", jsonDat, binDat, "binary"); err != nil {
+		t.Fatalf("json->binary convert failed: %v", err)
+	}
+	b, err := os.ReadFile(binDat)
+	if err != nil {
+		t.Fatalf("read converted binary failed: %v", err)
+	}
+	if !eruntime.IsEraBinaryData(b) {
+		t.Fatalf("expected converted binary dat")
+	}
+	if err := eruntime.ConvertDatFile("var", binDat, jsonOut, "json"); err != nil {
+		t.Fatalf("binary->json convert failed: %v", err)
+	}
+	if _, err := os.Stat(jsonOut); err != nil {
+		t.Fatalf("expected converted json file: %v", err)
 	}
 }

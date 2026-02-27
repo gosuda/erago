@@ -1,10 +1,10 @@
-# eraJS Compatibility Status (Native Go)
+# Emuera Compatibility Status (Native Go)
 
-This project targets full native parity with `eraJS` without JS binding.
+This project targets full native compatibility with Emuera without JS binding.
 
 ## Command coverage snapshot
 
-- eraJS command keys in parser: `268`
+- Emuera FunctionCode keys in parser target: `268`
 - parser recognition in Go: `268/268`
 - runtime dispatch/handler coverage: `257/268` command-key paths
 - remaining `11` are structural control/data blocks handled by dedicated AST execution:
@@ -57,7 +57,7 @@ Implemented assignment operators:
 
 ## Porting strategy
 
-1. Implement parser-level compatibility for all eraJS command spellings.
+1. Implement parser-level compatibility for Emuera command spellings.
 2. Port runtime value model (global/static/dynamic/character) and typed arrays.
 3. Port command groups by subsystem and lock with compatibility tests.
 4. Add and maintain native regression test fixtures for command groups.

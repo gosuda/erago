@@ -1,70 +1,77 @@
 # erago
 
-Go implementation scaffold of an `emuera`-style runtime, designed with the same high-level flow as [eraJS](https://github.com/undercrow/eraJS):
+`erago` is a Go CLI/runtime for running Emuera-style `ERB/ERH/CSV` game files.
 
-1. compile scripts (`ERH` + `ERB`)
-2. build VM
-3. run entry function and process flow control (`BEGIN`, `CALL`, `GOTO`, `RETURN`, `QUIT`)
+## Prerequisites
 
-## Current scope
+- Go `1.25+`
 
-This is a minimal executable core, not full emuera compatibility.
+## Project Layout
 
-Supported now (native Go):
-- Function parsing: `@FUNC(...)`
-- Labels: `$LABEL`
-- Statements:
-  - Output: `PRINT`, `PRINTL`
-  - Assignment: `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `++`, `--`
-  - Control flow: `IF/ELSEIF/ELSE/ENDIF`, `SIF`, `GOTO`, `BREAK`, `CONTINUE`
-  - Loop: `FOR/NEXT`, `WHILE/WEND`, `DO/LOOP`, `REPEAT/REND`
-  - Call/flow: `CALL`, `RETURN`, `BEGIN`, `QUIT`
-- Expression evaluator: integers, strings, variables, unary (`+ - ! ~`), binary operators (`* / % + - << >> < <= > >= == != & | ^ && ||`)
-- ERH preprocessor basics: comment stripping, macro blocks (`[IF ...]...[ENDIF]`), `#DEFINE`
-- eraJS command keyword recognition: `268/268` parser keys (runtime behavior is still being filled subsystem by subsystem)
-- Runtime additions in this batch:
-  - `PRINTFORM*` placeholder expansion (`%expr%`, `{expr}` basic support)
-  - CSV lookup command baseline (`CSV*` command family -> `RESULT`)
-  - Save/load baseline (`SAVEGAME`, `LOADGAME`, `SAVEDATA`, `LOADDATA`, `DELDATA`, `CHKDATA`, `SAVEGLOBAL`, `LOADGLOBAL`)
-  - Method-like command baseline (`ABS`, `SIGN`, `MAX`, `MIN`, `POWER`, `SQRT`, `LIMIT`, `INRANGE`, `RAND`, `STRLEN*`, `STRFIND*`, `SUBSTRING*`, `TOINT`, `TOSTR`, `EXISTCSV`)
-  - Variable/bit command baseline (`VARSET`, `CVARSET`, `GETBIT`, `SETBIT`, `CLEARBIT`, `INVERTBIT`)
-  - Block command baseline (`SELECTCASE/CASE/CASEELSE/ENDSELECT`, `STRDATA`, `PRINTDATA*`, `DATA`, `DATAFORM`, `ENDDATA`)
-  - Indexed variable baseline:
-    - `#DIM/#DIMS` declaration ingestion
-    - `VAR:idx` access in expressions/assignment
-    - array data persisted in save/load snapshots
-  - Scope/prefix baseline:
-    - function property `#DIM/#DIMS` -> local declarations
-    - `DYNAMIC` arrays auto-grow on indexed write
-    - `REF` declarations with reference binding (`R = A` 형태)
-  - Additional command baseline:
-    - array helpers (`ARRAYSHIFT`, `ARRAYREMOVE`, `SWAP`)
-    - character helpers (`ADDCHARA*`, `DELCHARA*`, `GETCHARA`, `FINDCHARA*`, `SWAPCHARA`, `SORTCHARA`, `COPYCHARA`, `ADDCOPYCHARA`, `PICKUPCHARA`)
-    - UI helpers (`ALIGNMENT`, `CURRENTALIGN`, `REDRAW`, `CURRENTREDRAW`, `SKIPDISP`, `ISSKIP`, `SETCOLOR*`, `SETBGCOLOR*`, `GETCOLOR*`, `SETFONT/GETFONT/CHKFONT`, `FONT*`)
+- Put game files under a folder such as `era_files/<game_name>/`.
+- Example included in this repo:
+  - `era_files/mini_adventure`
 
-## Run
+## Quick Start (Run From Source)
 
 ```bash
-go run ./cmd/erago -dir ./examples/basic -entry TITLE
+go run ./cmd/erago -base ./era_files/mini_adventure -entry TITLE
 ```
 
-## Library usage
+## Build and Run Binary
 
-```go
-vm, err := erago.Compile(files)
-if err != nil {
-    panic(err)
-}
+Build:
 
-outputs, err := vm.Run("TITLE")
-if err != nil {
-    panic(err)
-}
+```bash
+go build -o ./bin/erago ./cmd/erago
 ```
 
-## Next work for fuller compatibility
+Run:
 
-- Full emuera command surface (many `PRINT*`, I/O, save/load, character/csv systems)
-- Inline function calls in expressions
-- Array/scoped variables and property directives (`#DIM`, `#LOCALSIZE`, ...)
-- Rich output model (wait/input/chunk/button) compatible with UI frontend
+```bash
+./bin/erago -base ./era_files/mini_adventure -entry TITLE -savefmt json
+```
+
+Build + run in one command:
+
+```bash
+go build -o ./bin/erago ./cmd/erago && ./bin/erago -base ./era_files/mini_adventure -entry TITLE -savefmt json
+```
+
+## CLI Options
+
+- `-base`: base directory containing `.erb/.erh/.csv` and save files
+- `-dir`: deprecated alias for `-base`
+- `-entry`: entry function name (default: `TITLE`)
+- `-savefmt`: save payload format (`json`, `binary`, `both`)
+
+See all options:
+
+```bash
+go run ./cmd/erago -h
+```
+
+## Save Files
+
+- Save files are written under the same directory passed to `-base`.
+- `SAVEVAR/SAVECHARA` support:
+  - `json`: JSON payload in `.dat`
+  - `binary`: Emuera-style binary `.dat`
+  - `both`: binary `.dat` + companion `.json`
+
+## TUI Controls
+
+- `q`: quit
+- `r`: rerun
+- `j/k`, `pgup/pgdn`: scroll
+- `g/G`: top/bottom
+- `ctrl+c`: force quit
+
+## Save Format Converter
+
+Convert save data between JSON and binary:
+
+```bash
+go run ./cmd/savecodec -kind var -in ./save/var_case1.dat -out ./save/var_case1.bin.dat -to binary
+go run ./cmd/savecodec -kind var -in ./save/var_case1.bin.dat -out ./save/var_case1.json -to json
+```

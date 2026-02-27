@@ -27,7 +27,7 @@ type saveArraySnapshot struct {
 
 func (vm *VM) ensureSaveDir() error {
 	if vm.saveDir == "" {
-		vm.saveDir = filepath.Join(".", ".erago_saves")
+		vm.saveDir = "."
 	}
 	return os.MkdirAll(vm.saveDir, 0o755)
 }

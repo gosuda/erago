@@ -1,0 +1,133 @@
+@TITLE
+IF HP <= 0
+    HP = MAX_HP
+ENDIF
+IF DAY <= 0
+    DAY = 1
+ENDIF
+IF NAME == ""
+    PRINTL Welcome to Mini Adventure.
+    PRINTL Enter your name:
+    INPUTS "Hero"
+    NAME = RESULTS
+    GOLD = 5
+    HP = MAX_HP
+    PRINTFORML Hello, {NAME}. Your journey begins.
+    WAIT
+ENDIF
+
+$MENU
+PRINTL
+PRINTFORML ==== Day {DAY} ====
+PRINTFORML NAME={NAME} HP={HP} GOLD={GOLD}
+PRINTL 1) Explore
+PRINTL 2) Rest (cost 1 GOLD)
+PRINTL 3) Work (+2 GOLD)
+PRINTL 4) Save
+PRINTL 5) Load
+PRINTL 9) Quit
+INPUT 1
+MENUCHOICE = RESULT
+
+IF MENUCHOICE == 1
+    GOTO EXPLORE
+ELSEIF MENUCHOICE == 2
+    GOTO REST
+ELSEIF MENUCHOICE == 3
+    GOTO WORK
+ELSEIF MENUCHOICE == 4
+    GOTO SAVEPOINT
+ELSEIF MENUCHOICE == 5
+    GOTO LOADPOINT
+ELSEIF MENUCHOICE == 9
+    QUIT
+ENDIF
+
+PRINTL Invalid choice.
+WAIT
+GOTO MENU
+
+$EXPLORE
+PRINTL You found a cave.
+PRINTL 1) Enter (risk, +3 GOLD)
+PRINTL 2) Leave
+TINPUT 6000, 2, 1, "Timeout. You step back."
+ACT = RESULT
+IF ACT == 1
+    PRINTL A bat attacks you.
+    HP -= 2
+    GOLD += 3
+    PRINTL You survived and found coins.
+ELSE
+    PRINTL You leave safely.
+ENDIF
+DAY += 1
+IF HP <= 0
+    GOTO GAMEOVER
+ENDIF
+WAIT
+GOTO MENU
+
+$REST
+IF GOLD <= 0
+    PRINTL Not enough GOLD.
+ELSE
+    GOLD -= 1
+    HP += 3
+    IF HP > MAX_HP
+        HP = MAX_HP
+    ENDIF
+    PRINTL You feel better.
+ENDIF
+DAY += 1
+WAIT
+GOTO MENU
+
+$WORK
+PRINTL You worked at the tavern.
+GOLD += 2
+HP -= 1
+DAY += 1
+IF HP <= 0
+    GOTO GAMEOVER
+ENDIF
+WAIT
+GOTO MENU
+
+$SAVEPOINT
+SAVEVAR "slot1", "mini_adventure", NAME, HP, GOLD, DAY
+IF RESULT == 1
+    PRINTL Saved to slot1.
+ELSE
+    PRINTL Save failed.
+ENDIF
+WAIT
+GOTO MENU
+
+$LOADPOINT
+LOADVAR "slot1"
+IF RESULT == 1
+    PRINTL Loaded slot1.
+ELSE
+    PRINTL No save found.
+ENDIF
+WAIT
+GOTO MENU
+
+$GAMEOVER
+PRINTL You collapse from exhaustion.
+PRINTL 1) Load save
+PRINTL 2) Restart
+PRINTL 9) Quit
+INPUT 1
+G = RESULT
+IF G == 1
+    GOTO LOADPOINT
+ELSEIF G == 2
+    NAME = ""
+    HP = MAX_HP
+    GOLD = 5
+    DAY = 1
+    GOTO TITLE
+ENDIF
+QUIT
