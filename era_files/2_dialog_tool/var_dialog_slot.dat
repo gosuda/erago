@@ -1,0 +1,28 @@
+{
+  "format": "erago.var.v1",
+  "saved_at": "2026-02-27T15:07:12.261578923+09:00",
+  "save_mes": "dialog_tool",
+  "globals": {
+    "LAST_MSG": {
+      "kind": "string",
+      "s": "..."
+    },
+    "MOOD": {
+      "kind": "int",
+      "i": 2
+    },
+    "TALK_COUNT": {
+      "kind": "int",
+      "i": 4
+    },
+    "USER_NAME": {
+      "kind": "int"
+    }
+  },
+  "var_order": [
+    "LAST_MSG",
+    "MOOD",
+    "TALK_COUNT",
+    "USER_NAME"
+  ]
+}

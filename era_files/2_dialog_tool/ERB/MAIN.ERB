@@ -1,0 +1,107 @@
+@TITLE
+IF USER_NAME == ""
+    PRINTL Dialog Tool Example
+    PRINTL Enter your name:
+    INPUTS "User"
+    USER_NAME = RESULTS
+    TALK_COUNT = 0
+    LAST_MSG = ""
+    MOOD = 1
+    PRINTFORML Hello, {USER_NAME}. Let's chat.
+    WAIT
+ENDIF
+
+$MENU
+PRINTL
+PRINTFORML ==== Dialog Menu ({USER_NAME}) ====
+PRINTFORML Talks={TALK_COUNT} Mood={MOOD}
+PRINTL 1) Say hello
+PRINTL 2) Ask for advice
+PRINTL 3) Free message
+PRINTL 4) Show session
+PRINTL 5) Save session
+PRINTL 6) Load session
+PRINTL 9) Quit
+INPUT 1
+MENU = RESULT
+
+IF MENU == 1
+    GOTO SAY_HELLO
+ELSEIF MENU == 2
+    GOTO ASK_ADVICE
+ELSEIF MENU == 3
+    GOTO FREE_MESSAGE
+ELSEIF MENU == 4
+    GOTO SHOW_SESSION
+ELSEIF MENU == 5
+    GOTO SAVE_SESSION
+ELSEIF MENU == 6
+    GOTO LOAD_SESSION
+ELSEIF MENU == 9
+    QUIT
+ENDIF
+
+PRINTL Invalid choice.
+WAIT
+GOTO MENU
+
+$SAY_HELLO
+PRINTFORML Bot: Hi {USER_NAME}, good to see you.
+TALK_COUNT += 1
+MOOD = 2
+WAIT
+GOTO MENU
+
+$ASK_ADVICE
+PRINTL 1) Focus mode
+PRINTL 2) Rest mode
+INPUT 1
+CHOICE = RESULT
+IF CHOICE == 1
+    PRINTL Bot: Do one small task, then take a short break.
+    MOOD = 3
+ELSE
+    PRINTL Bot: Drink water and stretch for 2 minutes.
+    MOOD = 2
+ENDIF
+TALK_COUNT += 1
+WAIT
+GOTO MENU
+
+$FREE_MESSAGE
+PRINTL Type a message (10s timeout):
+TINPUTS 10000, "...", 1, "No input."
+LAST_MSG = RESULTS
+PRINTFORML You: {LAST_MSG}
+PRINTFORML Bot: Received. ({LAST_MSG})
+TALK_COUNT += 1
+WAIT
+GOTO MENU
+
+$SHOW_SESSION
+PRINTFORML USER={USER_NAME}
+PRINTFORML TALKS={TALK_COUNT}
+PRINTFORML MOOD={MOOD}
+PRINTFORML LAST={LAST_MSG}
+WAIT
+GOTO MENU
+
+$SAVE_SESSION
+SAVEVAR SAVE_SLOT, "dialog_tool", USER_NAME, TALK_COUNT, LAST_MSG, MOOD
+IF RESULT == 1
+    PRINTL Session saved.
+ELSE
+    PRINTL Save failed.
+ENDIF
+WAIT
+GOTO MENU
+
+$LOAD_SESSION
+LOADVAR SAVE_SLOT
+IF RESULT == 1
+    PRINTL Session loaded.
+ELSE
+    PRINTL No session found.
+ENDIF
+WAIT
+GOTO MENU
