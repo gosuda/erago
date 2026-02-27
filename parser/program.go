@@ -39,11 +39,12 @@ func ParseProgram(files map[string]string) (*ast.Program, error) {
 	}
 
 	return &ast.Program{
-		Defines:    erhRes.Defines,
-		Functions:  res.Functions,
-		Order:      res.Order,
-		CSVFiles:   csv,
-		StringVars: erhRes.StringVars,
-		VarDecls:   erhRes.VarDecls,
+		Defines:        erhRes.Defines,
+		Functions:      res.Functions,
+		Order:          res.Order,
+		CSVFiles:       csv,
+		StringVars:     erhRes.StringVars,
+		VarDecls:       erhRes.VarDecls,
+		EventFunctions: res.EventFunctions,
 	}, nil
 }

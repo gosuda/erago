@@ -543,7 +543,7 @@ func isIdentStart(r rune) bool {
 }
 
 func isIdentPart(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '・' || r == '·'
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '@' || r == '・' || r == '·'
 }
 
 func isHexDigit(r rune) bool {

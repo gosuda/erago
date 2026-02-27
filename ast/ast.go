@@ -7,6 +7,9 @@ type Program struct {
 	CSVFiles   map[string]string
 	StringVars map[string]struct{}
 	VarDecls   []VarDecl
+	// EventFunctions stores all functions for event names (EVENTSHOP, EVENTFIRST, etc.)
+	// These functions are called in order, not merged
+	EventFunctions map[string][]*Function
 }
 
 type VarDecl struct {
@@ -23,6 +26,7 @@ type Function struct {
 	Args     []Arg
 	Body     *Thunk
 	VarDecls []VarDecl
+	Priority int // #PRI attribute: higher = called first
 }
 
 type Arg struct {
@@ -122,8 +126,10 @@ type ContinueStmt struct{}
 func (ContinueStmt) isStatement() {}
 
 type CommandStmt struct {
-	Name string
-	Arg  string
+	Name         string
+	Arg          string
+	PrintNewLine bool
+	PrintWait    bool
 }
 
 func (CommandStmt) isStatement() {}
@@ -150,8 +156,10 @@ type CaseCondition struct {
 }
 
 type PrintDataStmt struct {
-	Command string
-	Items   []DataItem
+	Command      string
+	Items        []DataItem
+	PrintNewLine bool
+	PrintWait    bool
 }
 
 func (PrintDataStmt) isStatement() {}

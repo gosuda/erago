@@ -6,11 +6,11 @@
 ## Run 1_adventure
 
 ```bash
-go run ./cmd/erago -base ./era_files/1_adventure -entry TITLE
+go run ./cmd/erago -base ./era_files/1_adventure
 ```
 
 ## Run 2_dialog_tool
 
 ```bash
-go run ./cmd/erago -base ./era_files/2_dialog_tool -entry TITLE
+go run ./cmd/erago -base ./era_files/2_dialog_tool
 ```

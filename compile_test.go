@@ -3,6 +3,7 @@ package erago_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gosuda/erago"
@@ -906,6 +907,64 @@ QUIT
 	}
 }
 
+func TestPrintWConsumesQueuedInputBeforeInput(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+PRINTW hello
+INPUT
+PRINTVL RESULT
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	vm.EnqueueInput("7")
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatalf("unexpected empty output")
+	}
+	last := out[len(out)-1].Text
+	if last != "0" {
+		t.Fatalf("PRINTW should consume queued input before INPUT: got=%q out=%+v", last, out)
+	}
+}
+
+func TestPrintDataWConsumesQueuedInputBeforeInput(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+PRINTDATAW
+DATA apple
+ENDDATA
+INPUT
+PRINTVL RESULT
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	vm.EnqueueInput("5")
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatalf("unexpected empty output")
+	}
+	last := out[len(out)-1].Text
+	if last != "0" {
+		t.Fatalf("PRINTDATAW should consume queued input before INPUT: got=%q out=%+v", last, out)
+	}
+}
+
 func TestSaveVarLoadVarCompat(t *testing.T) {
 	files := map[string]string{
 		"MAIN.ERH": `
@@ -1088,5 +1147,275 @@ QUIT
 	}
 	if _, err := os.Stat(jsonOut); err != nil {
 		t.Fatalf("expected converted json file: %v", err)
+	}
+}
+
+func TestScopedArgReferenceByFunctionSubID(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+TALENT:1:150 = 1
+CALL ERASE_MEMORY(1)
+QUIT
+
+@ERASE_MEMORY(ARG)
+CALL SELF_KOJO_K11
+RETURN 0
+
+@SELF_KOJO_K11
+IF TALENT:(ARG@ERASE_MEMORY):150
+    PRINTL ok
+ELSE
+    PRINTL ng
+ENDIF
+RETURN 0
+`,
+	}
+
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("unexpected output count: %d", len(out))
+	}
+	if out[0].Text != "ok" {
+		t.Fatalf("unexpected output: %+v", out[0])
+	}
+}
+
+func TestHTMLStringFunctions(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+LOCALS = <font color='red'>Hello</font> World
+A = HTML_STRINGLEN(LOCALS)
+PRINTVL A
+LOCALS:1 = HTML_SUBSTRING(LOCALS, 0, 5)
+PRINTFORML %LOCALS:1%
+LOCALS:2 = HTML_SUBSTRING(LOCALS, 5, 10)
+PRINTFORML %LOCALS:2%
+B = HTML_STRINGLINES("<p>Line1</p><p>Line2</p>")
+PRINTVL B
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) < 4 {
+		t.Fatalf("unexpected output count: %d", len(out))
+	}
+	if out[0].Text != "11" {
+		t.Fatalf("HTML_STRINGLEN expected 11, got %q", out[0].Text)
+	}
+	if out[3].Text != "1" {
+		t.Fatalf("HTML_STRINGLINES expected 1, got %q", out[3].Text)
+	}
+}
+
+func TestDynamicVariableFunctions(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+A = 123
+LOCALS = "A"
+B = GETVAR(LOCALS)
+PRINTVL B
+C = EXISTVAR("A")
+PRINTVL C
+D = EXISTVAR("NONEXISTENT")
+PRINTVL D
+E = ISDEFINED("TITLE")
+PRINTVL E
+F = ISDEFINED("NONEXISTENT_FUNC")
+PRINTVL F
+G = EXISTFUNCTION("TITLE")
+PRINTVL G
+H = "A"
+SETVAR H, 456
+PRINTVL A
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	expected := []string{"123", "1", "0", "1", "0", "1", "456"}
+	for i, exp := range expected {
+		if i >= len(out) {
+			t.Fatalf("missing output at index %d", i)
+		}
+		if out[i].Text != exp {
+			t.Fatalf("output[%d] expected %q, got %q", i, exp, out[i].Text)
+		}
+	}
+}
+
+func TestRegexpMatch(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+LOCALS = "Hello123World"
+LOCALS:1 = "Hello"
+A = REGEXPMATCH(LOCALS, LOCALS:1)
+PRINTFORML A=%A%
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) < 1 {
+		t.Fatalf("missing output")
+	}
+	t.Logf("output: %q", out[0].Text)
+	if out[0].Text != "A=1" {
+		t.Fatalf("expected A=1, got %q", out[0].Text)
+	}
+}
+
+func TestEnumFunctions(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+LOCALS = ENUMFUNCBEGINSWITH("TI")
+PRINTFORML %LOCALS%
+LOCALS:1 = ENUMVARBEGINSWITH("RES")
+PRINTFORML %LOCALS:1%
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) < 2 {
+		t.Fatalf("unexpected output count: %d", len(out))
+	}
+	if !containsString(out[0].Text, "TITLE") {
+		t.Fatalf("ENUMFUNCBEGINSWITH should contain TITLE, got %q", out[0].Text)
+	}
+	if !containsString(out[1].Text, "RESULT") {
+		t.Fatalf("ENUMVARBEGINSWITH should contain RESULT, got %q", out[1].Text)
+	}
+}
+
+func containsString(s, substr string) bool {
+	return len(s) > 0 && (s == substr || len(s) > len(substr) && (s[:len(substr)] == substr || s[len(s)-len(substr):] == substr || containsMiddle(s, substr)))
+}
+
+func containsMiddle(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMathFunctions(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+A = CBRT(27)
+B = LOG(100)
+C = LOG10(1000)
+D = EXPONENT(3)
+E = EXPONENT(2, 10)
+PRINTFORML CBRT(27)=%A%
+PRINTFORML LOG(100)=%B%
+PRINTFORML LOG10(1000)=%C%
+PRINTFORML EXPONENT(3)=%D%
+PRINTFORML EXPONENT(2,10)=%E%
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	expected := []string{"CBRT(27)=3", "LOG10(1000)=3", "EXPONENT(3)=3", "EXPONENT(2,10)=1024"}
+	for _, exp := range expected {
+		found := false
+		for _, o := range out {
+			if strings.Contains(o.Text, exp) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected output containing %q, got %v", exp, out)
+		}
+	}
+}
+
+func TestColorFunctions(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+A = COLOR_FROMNAME("red")
+B = COLOR_FROMNAME("blue")
+C = COLOR_FROMRGB(255, 128, 0)
+PRINTFORML COLOR_FROMNAME("red")=%A%
+PRINTFORML COLOR_FROMNAME("blue")=%B%
+PRINTFORML COLOR_FROMRGB(255,128,0)=%C%
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	expected := []struct {
+		key   string
+		value string
+	}{
+		{"COLOR_FROMNAME(\"red\")", "16711680"},
+		{"COLOR_FROMNAME(\"blue\")", "255"},
+		{"COLOR_FROMRGB(255,128,0)", "16744448"},
+	}
+	for _, exp := range expected {
+		found := false
+		for _, o := range out {
+			if strings.Contains(o.Text, exp.key+"="+exp.value) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected output containing %s=%s, got %v", exp.key, exp.value, out)
+		}
 	}
 }

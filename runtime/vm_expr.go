@@ -37,15 +37,82 @@ func (vm *VM) evalExpr(e ast.Expr) (Value, error) {
 			return Value{}, fmt.Errorf("unsupported unary operator %q", ex.Op)
 		}
 	case ast.BinaryExpr:
-		left, err := vm.evalExpr(ex.Left)
-		if err != nil {
-			return Value{}, err
+		switch ex.Op {
+		case "&&":
+			left, err := vm.evalExpr(ex.Left)
+			if err != nil {
+				return Value{}, err
+			}
+			if !left.Truthy() {
+				return Int(0), nil
+			}
+			right, err := vm.evalExpr(ex.Right)
+			if err != nil {
+				return Value{}, err
+			}
+			if right.Truthy() {
+				return Int(1), nil
+			}
+			return Int(0), nil
+		case "||":
+			left, err := vm.evalExpr(ex.Left)
+			if err != nil {
+				return Value{}, err
+			}
+			if left.Truthy() {
+				return Int(1), nil
+			}
+			right, err := vm.evalExpr(ex.Right)
+			if err != nil {
+				return Value{}, err
+			}
+			if right.Truthy() {
+				return Int(1), nil
+			}
+			return Int(0), nil
+		case "!&":
+			left, err := vm.evalExpr(ex.Left)
+			if err != nil {
+				return Value{}, err
+			}
+			if !left.Truthy() {
+				return Int(1), nil
+			}
+			right, err := vm.evalExpr(ex.Right)
+			if err != nil {
+				return Value{}, err
+			}
+			if right.Truthy() {
+				return Int(0), nil
+			}
+			return Int(1), nil
+		case "!|":
+			left, err := vm.evalExpr(ex.Left)
+			if err != nil {
+				return Value{}, err
+			}
+			if left.Truthy() {
+				return Int(0), nil
+			}
+			right, err := vm.evalExpr(ex.Right)
+			if err != nil {
+				return Value{}, err
+			}
+			if right.Truthy() {
+				return Int(0), nil
+			}
+			return Int(1), nil
+		default:
+			left, err := vm.evalExpr(ex.Left)
+			if err != nil {
+				return Value{}, err
+			}
+			right, err := vm.evalExpr(ex.Right)
+			if err != nil {
+				return Value{}, err
+			}
+			return evalBinary(ex.Op, left, right)
 		}
-		right, err := vm.evalExpr(ex.Right)
-		if err != nil {
-			return Value{}, err
-		}
-		return evalBinary(ex.Op, left, right)
 	case ast.TernaryExpr:
 		cond, err := vm.evalExpr(ex.Cond)
 		if err != nil {
@@ -96,8 +163,7 @@ func (vm *VM) evalCallExpr(ex ast.CallExpr) (Value, error) {
 		}
 	}
 	if vm.program.Functions[name] != nil {
-		callArgs := trimCallArgsAtFirstMissing(args, missing)
-		if _, err := vm.callFunction(name, callArgs); err != nil {
+		if _, err := vm.callFunctionArgs(name, args, missing); err != nil {
 			if v, handled, mErr := vm.execMethodLike(name, rawExprArg); handled && mErr == nil {
 				return v, nil
 			}
@@ -137,20 +203,21 @@ func (vm *VM) evalCallExprArgs(exprs []ast.Expr) ([]Value, []bool, error) {
 	return args, missing, nil
 }
 
-func trimCallArgsAtFirstMissing(args []Value, missing []bool) []Value {
-	callArgs := make([]Value, 0, len(args))
-	for i, av := range args {
-		if i < len(missing) && missing[i] {
-			break
-		}
-		callArgs = append(callArgs, av)
-	}
-	return callArgs
-}
-
 func shouldPreferMethodLike(name string) bool {
 	switch name {
 	case "HTMLP", "HTMLFONT", "HTMLSTYLE", "HTMLNOBR", "HTMLCOLOR", "HTMLBUTTON", "HTMLAUTOBUTTON", "HTMLNONBUTTON":
+		return true
+	case "REGEXPMATCH", "HTML_STRINGLEN", "HTML_SUBSTRING", "HTML_STRINGLINES":
+		return true
+	case "ISDEFINED", "EXISTVAR", "GETVAR", "GETVARS", "SETVAR":
+		return true
+	case "ENUMFUNCBEGINSWITH", "ENUMFUNCENDSWITH", "ENUMFUNCWITH":
+		return true
+	case "ENUMVARBEGINSWITH", "ENUMVARENDSWITH", "ENUMVARWITH":
+		return true
+	case "ENUMMACROBEGINSWITH", "ENUMMACROENDSWITH", "ENUMMACROWITH":
+		return true
+	case "EXISTFUNCTION":
 		return true
 	default:
 		return false
@@ -247,12 +314,15 @@ func evalBinary(op string, left, right Value) (Value, error) {
 		return Int(left.Int64() * right.Int64()), nil
 	case "/":
 		if right.Int64() == 0 {
-			return Value{}, fmt.Errorf("division by zero")
+			// Emulate permissive gameplay behavior for broken scripts/data:
+			// treat x/0 as x/1 instead of aborting execution.
+			return Int(left.Int64()), nil
 		}
 		return Int(left.Int64() / right.Int64()), nil
 	case "%":
 		if right.Int64() == 0 {
-			return Value{}, fmt.Errorf("modulo by zero")
+			// Keep modulo consistent with the x/1 fallback above.
+			return Int(0), nil
 		}
 		return Int(left.Int64() % right.Int64()), nil
 	case "<<":

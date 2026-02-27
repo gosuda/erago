@@ -28,7 +28,12 @@ Implemented execution entries (native runtime):
   - CSV command family baseline (`CSV*`)
   - Save/load command baseline (`SAVEGAME`, `LOADGAME`, `SAVEDATA`, `LOADDATA`, `DELDATA`, `CHKDATA`, `SAVEGLOBAL`, `LOADGLOBAL`)
   - PRINTFORM baseline (`%expr%`, `{expr}` placeholder evaluation)
-  - Method-like command baseline (`ABS`, `SIGN`, `MAX`, `MIN`, `POWER`, `SQRT`, `LIMIT`, `INRANGE`, `RAND`, `STRLEN*`, `STRFIND*`, `SUBSTRING*`, `TOINT`, `TOSTR`, `EXISTCSV`)
+  - Method-like command baseline (`ABS`, `SIGN`, `MAX`, `MIN`, `POWER`, `SQRT`, `CBRT`, `LOG`, `LOG10`, `EXPONENT`, `LIMIT`, `INRANGE`, `RAND`, `STRLEN*`, `STRFIND*`, `SUBSTRING*`, `TOINT`, `TOSTR`, `EXISTCSV`, `REGEXPMATCH`)
+  - HTML string functions (`HTML_STRINGLEN`, `HTML_SUBSTRING`, `HTML_STRINGLINES`)
+  - Dynamic variable functions (`ISDEFINED`, `EXISTVAR`, `GETVAR`, `GETVARS`, `SETVAR`)
+  - Enumeration functions (`ENUMFUNC*`, `ENUMVAR*`, `ENUMMACRO*`, `EXISTFUNCTION`)
+  - Color functions (`COLOR_FROMNAME`, `COLOR_FROMRGB`)
+  - Character data functions (`CHKCHARADATA`, `FIND_CHARADATA`)
   - Variable/bit operation baseline (`VARSET`, `CVARSET`, `GETBIT`, `SETBIT`, `CLEARBIT`, `INVERTBIT`)
   - Block command baseline (`SELECTCASE`, `CASE`, `CASEELSE`, `ENDSELECT`, `STRDATA`, `PRINTDATA*`, `DATA`, `DATAFORM`, `ENDDATA`)
   - Indexed variable baseline (`#DIM/#DIMS` ingest, `VAR:idx` read/write in parser/runtime, save/load )
@@ -47,7 +52,7 @@ Implemented assignment operators:
 ## Remaining major areas
 
 - Full PRINT family (`PRINTFORM*`, `PRINTDATA*`, `PRINTBUTTON*`, etc.)
-- Input/wait commands (`INPUT*`, `TINPUT*`, `WAIT*`)
+- Input/wait commands (`INPUT*`, `TINPUT*`, `WAIT*`, `BINPUT*`, `ONEBINPUT*`)
 - Jump/call variants (`TRY*`, `CALLF`, `JUMP*`, `GOTOFORM*`)
 - CSV/character/value systems (`CSV*`, `ADDCHARA*`, `CVARSET`, etc.)
 - Save/load/data commands (`SAVE*`, `LOAD*`, `SAVEDATA`, `CHKDATA`, ...)

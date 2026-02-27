@@ -8,6 +8,7 @@ import (
 
 type CSVStore struct {
 	rowsByBase     map[string][][]string
+	charaRowsByID  map[int64][][]string
 	nameByBase     map[string]map[int64]string
 	charaExists    map[int64]struct{}
 	gameCode       int64
@@ -23,22 +24,24 @@ type CSVStore struct {
 
 func newCSVStore(files map[string]string) *CSVStore {
 	s := &CSVStore{
-		rowsByBase:  map[string][][]string{},
-		nameByBase:  map[string]map[int64]string{},
-		charaExists: map[int64]struct{}{},
-		gameCode:    0,
-		gameVersion: 0,
+		rowsByBase:    map[string][][]string{},
+		charaRowsByID: map[int64][][]string{},
+		nameByBase:    map[string]map[int64]string{},
+		charaExists:   map[int64]struct{}{},
+		gameCode:      0,
+		gameVersion:   0,
 	}
 	for file, content := range files {
 		base := csvBaseName(file)
 		if base == "" {
 			continue
 		}
-		if id, ok := charaIDFromBase(base); ok {
-			s.charaExists[id] = struct{}{}
-		}
 		rows := parseCSVContent(content)
 		s.rowsByBase[base] = rows
+		if id, ok := charaIDFromBase(base); ok {
+			s.charaExists[id] = struct{}{}
+			s.charaRowsByID[id] = rows
+		}
 		if base == "GAMEBASE" {
 			for _, row := range rows {
 				if len(row) < 2 {
@@ -47,25 +50,25 @@ func newCSVStore(files map[string]string) *CSVStore {
 				key := strings.TrimSpace(row[0])
 				val := strings.TrimSpace(row[1])
 				switch strings.ToUpper(key) {
-				case "CODE", "コード", "코드":
+				case "CODE", "\uCF54\uB4DC":
 					if n, err := strconv.ParseInt(val, 10, 64); err == nil {
 						s.gameCode = n
 						s.hasGameCode = true
 					}
-				case "VERSION", "バージョン", "버전":
+				case "VERSION", "\uBC84\uC804":
 					if n, err := strconv.ParseInt(val, 10, 64); err == nil {
 						s.gameVersion = n
 						s.hasGameVersion = true
 					}
-				case "TITLE", "タイトル", "타이틀":
+				case "TITLE", "\uD0C0\uC774\uD2C0":
 					s.gameTitle = val
-				case "AUTHOR", "作者", "작자", "저자":
+				case "AUTHOR", "\uC791\uC790":
 					s.gameAuthor = val
-				case "YEAR", "製作年", "제작년":
+				case "YEAR", "\uC2DC\uC791\uB144":
 					s.gameYear = val
-				case "WINDOWTITLE", "ウィンドウタイトル", "윈도우타이틀":
+				case "WINDOWTITLE", "\uC708\uB3C4\uC6B0\uD0C0\uC774\uD2C0":
 					s.windowTitle = val
-				case "INFO", "追加情報", "추가정보":
+				case "INFO", "\uCD94\uAC00\uC815\uBCF4":
 					s.gameInfo = val
 				}
 			}
@@ -82,8 +85,56 @@ func newCSVStore(files map[string]string) *CSVStore {
 			nameMap[id] = strings.TrimSpace(row[1])
 		}
 		s.nameByBase[base] = nameMap
+		s.ingestCharacterNameRows(base, rows)
 	}
 	return s
+}
+
+func (s *CSVStore) ingestCharacterNameRows(base string, rows [][]string) {
+	id, ok := charaIDFromBase(base)
+	if !ok {
+		return
+	}
+	name := ""
+	callName := ""
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		key := strings.TrimSpace(row[0])
+		val := strings.TrimSpace(row[1])
+		switch key {
+		case "\u756A\u53F7", "\uBC88\uD638", "NO", "ID":
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+				id = n
+			}
+		case "\u540D\u524D", "\uC774\uB984", "NAME":
+			name = val
+		case "\u547C\u3073\u540D", "\uD638\uCE6D", "CALLNAME":
+			callName = val
+		}
+	}
+	if name == "" && callName == "" {
+		return
+	}
+	if name == "" {
+		name = callName
+	}
+	if callName == "" {
+		callName = name
+	}
+	nameMap := s.nameByBase["NAME"]
+	if nameMap == nil {
+		nameMap = map[int64]string{}
+		s.nameByBase["NAME"] = nameMap
+	}
+	callMap := s.nameByBase["CALLNAME"]
+	if callMap == nil {
+		callMap = map[int64]string{}
+		s.nameByBase["CALLNAME"] = callMap
+	}
+	nameMap[id] = name
+	callMap[id] = callName
 }
 
 func parseCSVContent(raw string) [][]string {
@@ -148,6 +199,56 @@ func (s *CSVStore) Name(base string, id int64) (string, bool) {
 	return v, ok
 }
 
+func (s *CSVStore) CharaField(id int64, section, key string) (string, bool) {
+	rows := s.charaRowsByID[id]
+	if len(rows) == 0 {
+		return "", false
+	}
+	section = strings.ToUpper(strings.TrimSpace(section))
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", false
+	}
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		if !csvSectionMatches(section, row[0]) {
+			continue
+		}
+		if strings.TrimSpace(row[1]) != key {
+			continue
+		}
+		if len(row) >= 3 {
+			return strings.TrimSpace(row[2]), true
+		}
+		return "", true
+	}
+	return "", false
+}
+
+func csvSectionMatches(section, actual string) bool {
+	actual = strings.TrimSpace(actual)
+	switch section {
+	case "CSTR":
+		return strings.EqualFold(actual, "CSTR")
+	case "BASE":
+		return actual == "\u57FA\u790E" || strings.EqualFold(actual, "BASE")
+	case "TALENT":
+		return actual == "\u7D20\u8CEA" || strings.EqualFold(actual, "TALENT")
+	case "ABL":
+		return actual == "\u80FD\u529B" || strings.EqualFold(actual, "ABL")
+	case "EXP":
+		return actual == "\u7D4C\u9A13" || strings.EqualFold(actual, "EXP")
+	case "RELATION":
+		return actual == "\u76F8\u6027" || strings.EqualFold(actual, "RELATION")
+	case "EQUIP":
+		return actual == "\u88C5\u7740\u7269" || strings.EqualFold(actual, "EQUIP")
+	default:
+		return strings.EqualFold(actual, section)
+	}
+}
+
 func (s *CSVStore) Exists(base string) bool {
 	base = strings.ToUpper(strings.TrimSpace(base))
 	_, ok := s.rowsByBase[base]
@@ -186,6 +287,19 @@ func (s *CSVStore) FindID(base, name string) (int64, bool) {
 		return id, true
 	}
 	return 0, false
+}
+
+func (s *CSVStore) GetCSVMap(name string) map[string]string {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	m := s.nameByBase[name]
+	if m == nil {
+		return map[string]string{}
+	}
+	result := make(map[string]string, len(m))
+	for k, v := range m {
+		result[strconv.FormatInt(k, 10)] = v
+	}
+	return result
 }
 
 func (s *CSVStore) GameCodeVersion() (code int64, version int64, hasCode bool, hasVersion bool) {

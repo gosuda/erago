@@ -27,15 +27,34 @@ type InputRequest struct {
 }
 
 type InputState struct {
-	Phase       InputPhase
-	Current     *InputRequest
-	Queue       []string
-	LastValue   string
-	LastTimeout bool
+	Phase        InputPhase
+	Current      *InputRequest
+	Queue        []string
+	LastValue    string
+	LastTimeout  bool
+	MouseX       int
+	MouseY       int
+	MouseLeft    bool
+	MouseRight   bool
+	MouseMiddle  bool
+	KeysDown     map[string]bool
+	KeysTriggered map[string]bool
+	ClientWidth  int
+	ClientHeight int
 }
 
 func defaultInputState() InputState {
-	return InputState{Phase: InputIdle, Current: nil, Queue: nil, LastValue: "", LastTimeout: false}
+	return InputState{
+		Phase:         InputIdle,
+		Current:       nil,
+		Queue:         nil,
+		LastValue:     "",
+		LastTimeout:   false,
+		KeysDown:      map[string]bool{},
+		KeysTriggered: map[string]bool{},
+		ClientWidth:   800,
+		ClientHeight:  600,
+	}
 }
 
 func (vm *VM) EnqueueInput(values ...string) {
@@ -95,6 +114,25 @@ func firstRune(s string) string {
 
 func parseIntInput(raw string) (int64, bool) {
 	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	// Emuera users often input full-width numerals via IME.
+	// Normalize common full-width signs/digits before parsing.
+	var b strings.Builder
+	for _, r := range raw {
+		switch {
+		case r >= '０' && r <= '９':
+			b.WriteRune('0' + (r - '０'))
+		case r == '＋':
+			b.WriteByte('+')
+		case r == '－' || r == 'ー' || r == '―' || r == '−':
+			b.WriteByte('-')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	raw = strings.TrimSpace(b.String())
 	if raw == "" {
 		return 0, false
 	}
@@ -178,7 +216,7 @@ func (vm *VM) execWaitLike(name, arg string) (execResult, error) {
 }
 
 func (vm *VM) execInputIntLike(name, arg string) (execResult, error) {
-	req := InputRequest{Command: name, Numeric: true, OneInput: name == "ONEINPUT" || name == "TONEINPUT", Timed: strings.HasPrefix(name, "T"), Nullable: false}
+	req := InputRequest{Command: name, Numeric: true, OneInput: strings.HasPrefix(name, "ONE") || strings.HasPrefix(name, "TONE"), Timed: strings.HasPrefix(name, "T"), Nullable: false}
 	if !req.Timed {
 		if strings.TrimSpace(arg) != "" {
 			v, err := vm.evalLooseExpr(arg)
@@ -265,7 +303,7 @@ func (vm *VM) execInputIntLike(name, arg string) (execResult, error) {
 }
 
 func (vm *VM) execInputStringLike(name, arg string) (execResult, error) {
-	req := InputRequest{Command: name, Numeric: false, OneInput: name == "ONEINPUTS" || name == "TONEINPUTS", Timed: strings.HasPrefix(name, "T"), Nullable: false}
+	req := InputRequest{Command: name, Numeric: false, OneInput: strings.HasPrefix(name, "ONE") || strings.HasPrefix(name, "TONE"), Timed: strings.HasPrefix(name, "T"), Nullable: false}
 	if !req.Timed {
 		if strings.TrimSpace(arg) != "" {
 			v, err := vm.evalLooseExpr(arg)

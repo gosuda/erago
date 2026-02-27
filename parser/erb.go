@@ -10,14 +10,27 @@ import (
 )
 
 type ERBResult struct {
-	Functions map[string]*ast.Function
-	Order     []string
+	Functions      map[string]*ast.Function
+	Order          []string
+	EventFunctions map[string][]*ast.Function // Event functions that should be called multiple times
+}
+
+// isEventFunction returns true if the function name is an event function
+// Event functions are called in order (with #PRI first) when triggered by BEGIN
+func isEventFunction(name string) bool {
+	switch name {
+	case "EVENTSHOP", "EVENTFIRST", "EVENTTRAIN", "EVENTEND", "EVENTTURNEND",
+		"EVENTCOM", "EVENTLOAD", "SYSTEM_TITLE":
+		return true
+	}
+	return false
 }
 
 func ParseERB(files map[string]string, macros map[string]struct{}) (*ERBResult, error) {
 	result := &ERBResult{
-		Functions: map[string]*ast.Function{},
-		Order:     []string{},
+		Functions:      map[string]*ast.Function{},
+		Order:          []string{},
+		EventFunctions: map[string][]*ast.Function{},
 	}
 	for _, file := range sortedKeys(files) {
 		lines := preprocess(toLines(file, files[file]), macros)
@@ -28,6 +41,17 @@ func ParseERB(files map[string]string, macros map[string]struct{}) (*ERBResult, 
 			fn, consumed, err := parseFunction(lines, i)
 			if err != nil {
 				return nil, err
+			}
+			// Event functions are tracked separately and called in order
+			if isEventFunction(fn.Name) {
+				result.EventFunctions[fn.Name] = append(result.EventFunctions[fn.Name], fn)
+				// Also keep the first one in Functions map for lookups
+				if result.Functions[fn.Name] == nil {
+					result.Functions[fn.Name] = fn
+					result.Order = append(result.Order, fn.Name)
+				}
+				i += consumed
+				continue
 			}
 			if existing, exists := result.Functions[fn.Name]; exists {
 				if err := mergeDuplicateFunction(existing, fn); err != nil {
@@ -41,7 +65,23 @@ func ParseERB(files map[string]string, macros map[string]struct{}) (*ERBResult, 
 			i += consumed
 		}
 	}
+	// Sort event functions by priority (higher priority first)
+	for name, fns := range result.EventFunctions {
+		sortEventFunctions(fns)
+		result.EventFunctions[name] = fns
+	}
 	return result, nil
+}
+
+// sortEventFunctions sorts functions by priority (higher priority first)
+func sortEventFunctions(fns []*ast.Function) {
+	for i := 0; i < len(fns)-1; i++ {
+		for j := i + 1; j < len(fns); j++ {
+			if fns[j].Priority > fns[i].Priority {
+				fns[i], fns[j] = fns[j], fns[i]
+			}
+		}
+	}
 }
 
 func mergeDuplicateFunction(dst, src *ast.Function) error {
@@ -83,10 +123,13 @@ func parseFunction(lines []Line, from int) (*ast.Function, int, error) {
 	}
 	idx := from + 1
 	varDecls := make([]ast.VarDecl, 0, 2)
+	priority := 0
 	for idx < len(lines) && strings.HasPrefix(lines[idx].Content, "#") {
 		prop := strings.TrimSpace(lines[idx].Content[1:])
 		upper := strings.ToUpper(prop)
-		if strings.HasPrefix(upper, "DIMS ") {
+		if upper == "PRI" {
+			priority = 1
+		} else if strings.HasPrefix(upper, "DIMS ") {
 			if decl, ok := parseDimDecl(prop[len("DIMS"):], true, "local"); ok {
 				varDecls = append(varDecls, decl)
 			}
@@ -108,7 +151,7 @@ func parseFunction(lines []Line, from int) (*ast.Function, int, error) {
 	if consumed != end-idx {
 		return nil, 0, fmt.Errorf("%s:%d: parser consumed %d/%d lines", def.File, def.Number, consumed, end-idx)
 	}
-	return &ast.Function{Name: name, Args: args, Body: thunk, VarDecls: varDecls}, end - from, nil
+	return &ast.Function{Name: name, Args: args, Body: thunk, VarDecls: varDecls, Priority: priority}, end - from, nil
 }
 
 func parseFunctionDef(raw string) (string, []ast.Arg, error) {
@@ -339,9 +382,12 @@ func parseStatement(lines []Line, index int) (ast.Statement, int, error) {
 	}
 
 	if isKnownCommand(strings.ToUpper(cmd)) {
+		printNewLine, printWait := parsePrintFlags(strings.ToUpper(cmd))
 		return ast.CommandStmt{
-			Name: strings.ToUpper(cmd),
-			Arg:  strings.TrimSpace(rest),
+			Name:         strings.ToUpper(cmd),
+			Arg:          strings.TrimSpace(rest),
+			PrintNewLine: printNewLine,
+			PrintWait:    printWait,
 		}, 1, nil
 	}
 
@@ -383,9 +429,12 @@ func parseStatement(lines []Line, index int) (ast.Statement, int, error) {
 	}
 
 	if isIdentifier(strings.ToUpper(cmd)) {
+		printNewLine, printWait := parsePrintFlags(strings.ToUpper(cmd))
 		return ast.CommandStmt{
-			Name: strings.ToUpper(cmd),
-			Arg:  strings.TrimSpace(rest),
+			Name:         strings.ToUpper(cmd),
+			Arg:          strings.TrimSpace(rest),
+			PrintNewLine: printNewLine,
+			PrintWait:    printWait,
 		}, 1, nil
 	}
 
@@ -680,9 +729,12 @@ func parsePrintData(lines []Line, from int, command string) (ast.Statement, int,
 	if err != nil {
 		return nil, 0, err
 	}
+	printNewLine, printWait := parsePrintFlags(command)
 	return ast.PrintDataStmt{
-		Command: command,
-		Items:   items,
+		Command:      command,
+		Items:        items,
+		PrintNewLine: printNewLine,
+		PrintWait:    printWait,
 	}, consumed + 1, nil
 }
 
@@ -728,6 +780,20 @@ func parseDataBlock(lines []Line, from int) ([]ast.DataItem, int, error) {
 
 func indexWord(s, needle string) int {
 	return strings.Index(strings.ToUpper(s), strings.ToUpper(needle))
+}
+
+func parsePrintFlags(name string) (printNewLine bool, printWait bool) {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if !(strings.HasPrefix(name, "PRINT") || strings.HasPrefix(name, "DEBUGPRINT")) {
+		return false, false
+	}
+	if strings.HasSuffix(name, "W") {
+		return true, true
+	}
+	if strings.HasPrefix(name, "PRINTL") || strings.HasPrefix(name, "DEBUGPRINTL") || strings.HasSuffix(name, "L") {
+		return true, false
+	}
+	return false, false
 }
 
 func parseIf(lines []Line, from int) (ast.Statement, int, error) {

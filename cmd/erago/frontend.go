@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +26,7 @@ type model struct {
 	seq      int
 	history  []string
 	tail     string
+	stream   []eruntime.Output
 }
 
 var (
@@ -50,6 +50,7 @@ func newModel(cfg appConfig) model {
 		status:   "starting",
 		history:  nil,
 		tail:     "",
+		stream:   nil,
 	}
 }
 
@@ -104,23 +105,12 @@ func firstRuneText(s string) string {
 	return string(r[0])
 }
 
-func isStrictInt(s string) bool {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
-	}
-	if _, err := strconv.ParseInt(s, 10, 64); err != nil {
-		return false
-	}
-	return true
-}
-
 func isWaitRequest(req eruntime.InputRequest) bool {
 	if req.Numeric {
 		return false
 	}
 	switch strings.ToUpper(strings.TrimSpace(req.Command)) {
-	case "WAIT", "WAITANYKEY", "FORCEWAIT", "TWAIT", "AWAIT":
+	case "WAIT", "WAITANYKEY", "FORCEWAIT", "TWAIT", "AWAIT", "INPUTANY":
 		return true
 	default:
 		return false
@@ -235,12 +225,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "running"
 				return m, waitVMEvent(m.events)
 			}
+			if m.pending.req.OneInput && msg.Key().Text != "" {
+				val := firstRuneText(msg.Key().Text)
+				m.pending.resp <- vmInputResp{value: val, timeout: false}
+				m.pending = nil
+				m.input.Blur()
+				m.input.SetValue("")
+				m.status = "running"
+				return m, waitVMEvent(m.events)
+			}
 			if msg.String() == "enter" {
 				val := strings.TrimSpace(m.input.Value())
-				if m.pending.req.Numeric && val != "" && !isStrictInt(val) {
-					m.status = "numeric input required"
-					return m, nil
-				}
 				if !m.pending.req.Numeric && m.pending.req.OneInput {
 					val = firstRuneText(val)
 				}
@@ -298,11 +293,28 @@ func (m model) View() tea.View {
 }
 
 func (m *model) appendOutput(out eruntime.Output) {
-	if out.NewLine {
-		m.history = append(m.history, m.tail+out.Text)
-		m.tail = ""
+	if out.ClearLines > 0 {
+		n := out.ClearLines
+		if n > len(m.stream) {
+			n = len(m.stream)
+		}
+		m.stream = m.stream[:len(m.stream)-n]
 	} else {
-		m.tail += out.Text
+		m.stream = append(m.stream, out)
+	}
+	m.rebuildContent()
+}
+
+func (m *model) rebuildContent() {
+	m.history = m.history[:0]
+	m.tail = ""
+	for _, out := range m.stream {
+		if out.NewLine {
+			m.history = append(m.history, m.tail+out.Text)
+			m.tail = ""
+		} else {
+			m.tail += out.Text
+		}
 	}
 	content := strings.Join(m.history, "\n")
 	if m.tail != "" {
@@ -321,6 +333,7 @@ func (m *model) appendOutput(out eruntime.Output) {
 func (m *model) clearForRestart() {
 	m.history = nil
 	m.tail = ""
+	m.stream = nil
 	m.viewport.SetContent("")
 	m.pending = nil
 	m.seq = 0

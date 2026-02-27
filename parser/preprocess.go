@@ -63,7 +63,15 @@ func preprocess(lines []Line, macros map[string]struct{}) []Line {
 		processed = append(processed, line)
 	}
 
-	return concatBraceLines(processed)
+	filtered := make([]Line, 0, len(processed))
+	for _, line := range processed {
+		if isBracketDirective(line.Content) {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+
+	return concatBraceLines(filtered)
 }
 
 func stripRange(lines []Line, start, end string) []Line {
@@ -161,4 +169,21 @@ func stripComment(raw string) string {
 		}
 	}
 	return string(out)
+}
+
+func isBracketDirective(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
+		return false
+	}
+	inner := strings.TrimSpace(raw[1 : len(raw)-1])
+	if inner == "" {
+		return false
+	}
+	upper := strings.ToUpper(inner)
+	switch upper {
+	case "SKIPSTART", "SKIPEND", "IF_DEBUG", "ENDIF":
+		return true
+	}
+	return strings.HasPrefix(upper, "IF ")
 }

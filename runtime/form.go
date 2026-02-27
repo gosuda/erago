@@ -130,6 +130,11 @@ func (vm *VM) evalPercentPlaceholderExpr(raw string) (string, bool, error) {
 
 	parts := splitTopLevelRuntime(raw, ',')
 	if len(parts) < 2 {
+		if text, ok, err := vm.evalFormStringExpr(raw); err != nil {
+			return "", false, err
+		} else if ok {
+			return text, true, nil
+		}
 		return "", false, nil
 	}
 	baseRaw := strings.TrimSpace(parts[0])
@@ -138,12 +143,22 @@ func (vm *VM) evalPercentPlaceholderExpr(raw string) (string, bool, error) {
 		return "", false, nil
 	}
 	baseExpr, err := parser.ParseExpr(baseRaw)
-	if err != nil {
-		return "", false, nil
-	}
-	baseVal, err := vm.evalExpr(baseExpr)
-	if err != nil {
-		return "", false, err
+	baseText := ""
+	if err == nil {
+		baseVal, err := vm.evalExpr(baseExpr)
+		if err != nil {
+			return "", false, err
+		}
+		baseText = baseVal.String()
+	} else {
+		text, ok, err := vm.evalFormStringExpr(baseRaw)
+		if err != nil {
+			return "", false, err
+		}
+		if !ok {
+			return "", false, nil
+		}
+		baseText = text
 	}
 	widthVal, err := vm.evalLooseExpr(widthRaw)
 	if err != nil {
@@ -164,7 +179,7 @@ func (vm *VM) evalPercentPlaceholderExpr(raw string) (string, bool, error) {
 			}
 		}
 	}
-	return formatPrintField(baseVal.String(), int(widthVal.Int64()), align), true, nil
+	return formatPrintField(baseText, int(widthVal.Int64()), align), true, nil
 }
 
 func formatPrintField(text string, width int, align string) string {
@@ -189,6 +204,72 @@ func formatPrintField(text string, width int, align string) string {
 	default:
 		return pad + text
 	}
+}
+
+func (vm *VM) evalFormStringExpr(raw string) (string, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", true, nil
+	}
+	parts := splitTopLevelRuntime(raw, '+')
+	if len(parts) <= 1 {
+		text, ok, err := vm.evalFormStringTerm(raw)
+		if err != nil {
+			return "", false, err
+		}
+		return text, ok, nil
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		text, ok, err := vm.evalFormStringTerm(p)
+		if err != nil {
+			return "", false, err
+		}
+		if !ok {
+			return "", false, nil
+		}
+		b.WriteString(text)
+	}
+	return b.String(), true, nil
+}
+
+func (vm *VM) evalFormStringTerm(term string) (string, bool, error) {
+	term = strings.TrimSpace(term)
+	if term == "" {
+		return "", true, nil
+	}
+	if strings.HasPrefix(term, "@") && strings.HasSuffix(term, "@") && len(term) >= 2 {
+		inner := strings.TrimSpace(term[1 : len(term)-1])
+		if inner == "" {
+			return "", true, nil
+		}
+		text, ok, err := vm.evalAtPlaceholderExpr(inner)
+		if err != nil {
+			return "", false, err
+		}
+		if ok {
+			return text, true, nil
+		}
+	}
+	if uq, ok := tryUnquoteCommandString(term); ok {
+		text, err := vm.expandDecodedTemplate(uq)
+		if err != nil {
+			return "", false, err
+		}
+		return text, true, nil
+	}
+	if expr, err := parser.ParseExpr(term); err == nil {
+		v, err := vm.evalExpr(expr)
+		if err != nil {
+			return "", false, err
+		}
+		return v.String(), true, nil
+	}
+	text, err := vm.evalAtBranch(term)
+	if err != nil {
+		return "", false, err
+	}
+	return text, true, nil
 }
 
 func (vm *VM) evalBracePlaceholders(tmpl string) (string, error) {

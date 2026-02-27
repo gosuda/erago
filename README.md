@@ -1,5 +1,7 @@
 # erago
 
+![erago](./image.png)
+
 `erago` is a Go runtime/CLI for Emuera-style game files (`.erb`, `.erh`, `.csv`).
 
 ## Prerequisites
