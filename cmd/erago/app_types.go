@@ -43,6 +43,8 @@ type vmCountdownMsg struct {
 	seq int
 }
 
+type vmPollMsg struct{}
+
 type pendingInput struct {
 	req      eruntime.InputRequest
 	resp     chan vmInputResp

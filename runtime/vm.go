@@ -51,6 +51,8 @@ type VM struct {
 	outputHook     func(Output)
 	inputProvider  func(InputRequest) (string, bool, error)
 	printCCounter  int
+	execSteps      int64
+	execStepLimit  int64
 }
 
 type frame struct {
@@ -85,6 +87,8 @@ type execResult struct {
 
 var htmlTagPattern = regexp.MustCompile(`(?is)<[^>]*>`)
 
+const defaultExecStepLimit int64 = 5_000_000
+
 func New(program *ast.Program) (*VM, error) {
 	vm := &VM{
 		program:        program,
@@ -113,6 +117,8 @@ func New(program *ast.Program) (*VM, error) {
 		datSaveFormat:  "json",
 		outputHook:     nil,
 		inputProvider:  nil,
+		execSteps:      0,
+		execStepLimit:  defaultExecStepLimit,
 	}
 	vm.initSaveIdentity()
 	if err := vm.initDefines(); err != nil {
@@ -246,6 +252,7 @@ func (vm *VM) Run(entry string) ([]Output, error) {
 	vm.ui = defaultUIState()
 	vm.characters = nil
 	vm.nextCharID = 0
+	vm.execSteps = 0
 	vm.input = defaultInputState()
 	vm.input.Queue = queuedInput
 	vm.refreshCharacterGlobals()
@@ -917,6 +924,33 @@ func (vm *VM) callFunctionArgs(name string, args []Value, missing []bool) (execR
 	return res, nil
 }
 
+func (vm *VM) bumpExecStep(reason string) error {
+	if vm.execStepLimit <= 0 {
+		return nil
+	}
+	vm.execSteps++
+	if vm.execSteps < vm.execStepLimit {
+		return nil
+	}
+	fnName := ""
+	if fr := vm.currentFrame(); fr != nil && fr.fn != nil {
+		fnName = fr.fn.Name
+	}
+	if fnName == "" {
+		fnName = "<global>"
+	}
+	stack := make([]string, 0, len(vm.stack))
+	for i := len(vm.stack) - 1; i >= 0; i-- {
+		fr := vm.stack[i]
+		if fr == nil || fr.fn == nil {
+			continue
+		}
+		stack = append(stack, fr.fn.Name)
+	}
+	stackTrace := strings.Join(stack, " -> ")
+	return fmt.Errorf("execution step limit exceeded (%d) at %s (fn=%s pc=%d stack=%s)", vm.execStepLimit, reason, fnName, vm.execPC, stackTrace)
+}
+
 func (vm *VM) runThunk(thunk *ast.Thunk) (execResult, error) {
 	prevThunk := vm.execThunk
 	prevPC := vm.execPC
@@ -928,6 +962,9 @@ func (vm *VM) runThunk(thunk *ast.Thunk) (execResult, error) {
 	}()
 
 	for pc := 0; pc < len(thunk.Statements); pc++ {
+		if err := vm.bumpExecStep("statement"); err != nil {
+			return execResult{}, err
+		}
 		vm.execPC = pc
 		stmt := thunk.Statements[pc]
 		res, err := vm.runStatement(stmt)
@@ -1073,6 +1110,9 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 		return vm.runThunk(s.Else)
 	case ast.WhileStmt:
 		for {
+			if err := vm.bumpExecStep("while-loop"); err != nil {
+				return execResult{}, err
+			}
 			cond, err := vm.evalExpr(s.Cond)
 			if err != nil {
 				return execResult{}, err
@@ -1097,6 +1137,9 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 		}
 	case ast.DoWhileStmt:
 		for {
+			if err := vm.bumpExecStep("do-while-loop"); err != nil {
+				return execResult{}, err
+			}
 			res, err := vm.runThunk(s.Body)
 			if err != nil {
 				return execResult{}, err
@@ -1127,6 +1170,9 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 			n = 0
 		}
 		for i := int64(0); i < n; i++ {
+			if err := vm.bumpExecStep("repeat-loop"); err != nil {
+				return execResult{}, err
+			}
 			res, err := vm.runThunk(s.Body)
 			if err != nil {
 				return execResult{}, err
@@ -1168,6 +1214,9 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 			return execResult{}, err
 		}
 		for {
+			if err := vm.bumpExecStep("for-loop"); err != nil {
+				return execResult{}, err
+			}
 			curVal, err := vm.getVarRef(target)
 			if err != nil {
 				return execResult{}, err
@@ -1357,12 +1406,18 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 		if !vm.ui.SkipDisp {
 			isCol := isColumnPrint(name)
 			if isCol {
+				paddedText := formatPrintField(text, vm.ui.PrintCLength, "LEFT")
+				// Keep at least one visible separator between column cells even when
+				// content length reaches/exceeds the configured column width.
+				if !strings.HasSuffix(paddedText, " ") {
+					paddedText += " "
+				}
 				vm.printCCounter++
 				if vm.printCCounter >= int(vm.ui.PrintCPL) {
-					vm.emitOutput(Output{Text: text, NewLine: true})
+					vm.emitOutput(Output{Text: paddedText, NewLine: true})
 					vm.printCCounter = 0
 				} else {
-					vm.emitOutput(Output{Text: text, NewLine: false})
+					vm.emitOutput(Output{Text: paddedText, NewLine: false})
 				}
 			} else {
 				vm.emitOutput(Output{Text: text, NewLine: newLine})
@@ -4386,8 +4441,12 @@ func (vm *VM) execMethodFindElement(arg string, last bool) Value {
 	if !ok {
 		return Int(-1)
 	}
-	arr, ok := vm.lookupArray(strings.ToUpper(ref.Name))
+	name := strings.ToUpper(ref.Name)
+	arr, ok := vm.lookupArray(name)
 	if !ok || len(arr.Dims) == 0 {
+		if base, isCSVName := csvNameVarTargetBase(name); isCSVName {
+			return vm.execMethodFindElementCSV(base, parts, last)
+		}
 		return Int(-1)
 	}
 	target, err := vm.evalLooseExpr(parts[1])
@@ -4426,6 +4485,106 @@ func (vm *VM) execMethodFindElement(arg string, last bool) Value {
 		}
 	}
 	return Int(-1)
+}
+
+func (vm *VM) execMethodFindElementCSV(base string, parts []string, last bool) Value {
+	m := vm.csv.nameByBase[strings.ToUpper(strings.TrimSpace(base))]
+	if len(m) == 0 {
+		return Int(-1)
+	}
+	target, err := vm.evalLooseExpr(parts[1])
+	if err != nil {
+		return Int(-1)
+	}
+	start, end := csvNameSearchRange(m, parts, 2, 3)
+	exact := false
+	if len(parts) > 4 && strings.TrimSpace(parts[4]) != "" {
+		if v, err := vm.evalLooseExpr(parts[4]); err == nil {
+			exact = v.Truthy()
+		}
+	}
+
+	// Fast-path exact string lookup for TRAINNAME/ABLNAME/... tables.
+	if target.Kind() == StringKind && exact {
+		if id, ok := vm.csv.FindID(base, target.String()); ok && id >= start && id < end {
+			return Int(id)
+		}
+		return Int(-1)
+	}
+
+	var re *regexp.Regexp
+	if target.Kind() == StringKind && !exact {
+		if rx, err := regexp.Compile(target.String()); err == nil {
+			re = rx
+		}
+	}
+	if last {
+		for i := end - 1; i >= start; i-- {
+			v := Str("")
+			if s, ok := m[i]; ok {
+				v = Str(s)
+			}
+			if methodElementMatches(v, target, exact, re) {
+				return Int(i)
+			}
+		}
+		return Int(-1)
+	}
+	for i := start; i < end; i++ {
+		v := Str("")
+		if s, ok := m[i]; ok {
+			v = Str(s)
+		}
+		if methodElementMatches(v, target, exact, re) {
+			return Int(i)
+		}
+	}
+	return Int(-1)
+}
+
+func csvNameSearchRange(m map[int64]string, parts []string, startPart, endPart int) (int64, int64) {
+	maxID := int64(-1)
+	for id := range m {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	if maxID < 0 {
+		return 0, 0
+	}
+	n := maxID + 1
+	start := int64(0)
+	end := n
+	if startPart < len(parts) && strings.TrimSpace(parts[startPart]) != "" {
+		if v, err := parseLooseExpr(strings.TrimSpace(parts[startPart])); err == nil {
+			if lit, ok := v.(ast.IntLit); ok {
+				start = lit.Value
+			}
+		}
+	}
+	if endPart < len(parts) && strings.TrimSpace(parts[endPart]) != "" {
+		if v, err := parseLooseExpr(strings.TrimSpace(parts[endPart])); err == nil {
+			if lit, ok := v.(ast.IntLit); ok {
+				end = lit.Value
+			}
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 {
+		end = 0
+	}
+	if start > n {
+		start = n
+	}
+	if end > n {
+		end = n
+	}
+	if end < start {
+		end = start
+	}
+	return start, end
 }
 
 func (vm *VM) execMethodInRangeArray(arg string) Value {
@@ -4911,15 +5070,44 @@ func (vm *VM) expandDecodedTemplate(raw string) (string, error) {
 }
 
 func (vm *VM) parseVarRefRuntime(raw string) (ast.VarRef, error) {
-	e, err := parser.ParseExpr(strings.TrimSpace(raw))
-	if err != nil {
-		return ast.VarRef{}, err
+	tryParseRef := func(s string) (ast.VarRef, error) {
+		e, err := parser.ParseExpr(strings.TrimSpace(s))
+		if err != nil {
+			return ast.VarRef{}, err
+		}
+		ref, ok := e.(ast.VarRef)
+		if !ok {
+			return ast.VarRef{}, fmt.Errorf("not a variable reference")
+		}
+		return ref, nil
 	}
-	ref, ok := e.(ast.VarRef)
-	if !ok {
-		return ast.VarRef{}, fmt.Errorf("not a variable reference")
+
+	raw = strings.TrimSpace(raw)
+	if ref, err := tryParseRef(raw); err == nil {
+		return ref, nil
 	}
-	return ref, nil
+
+	// Emuera compatibility: commands like ARRAYCOPY often pass variable names
+	// as quoted strings, e.g. ARRAYCOPY "RESULT", "KOJO_CONF".
+	if uq, ok := tryUnquoteCommandString(raw); ok {
+		uq = strings.TrimSpace(decodeCommandCharSeq(uq))
+		if uq != "" {
+			if ref, err := tryParseRef(uq); err == nil {
+				return ref, nil
+			}
+		}
+	}
+
+	// Also accept string-literal expression tokens that evaluate to a var name.
+	if e, err := parser.ParseExpr(raw); err == nil {
+		if lit, ok := e.(ast.StringLit); ok {
+			if ref, err := tryParseRef(strings.TrimSpace(lit.Value)); err == nil {
+				return ref, nil
+			}
+		}
+	}
+
+	return ast.VarRef{}, fmt.Errorf("not a variable reference")
 }
 
 func (vm *VM) evalExprList(raw string) ([]Value, error) {

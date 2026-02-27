@@ -1419,3 +1419,206 @@ QUIT
 		}
 	}
 }
+
+func TestInputProvider(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+PRINTL Enter a number:
+INPUT
+PRINTVL RESULT
+PRINTL Done
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	
+	// Set up input provider that returns "42" for the first call
+	inputCount := 0
+	vm.SetInputProvider(func(req eruntime.InputRequest) (string, bool, error) {
+		inputCount++
+		if inputCount == 1 {
+			return "42", false, nil
+		}
+		return "", false, nil
+	})
+	
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	
+	// Check that input provider was called
+	if inputCount != 1 {
+		t.Fatalf("expected input provider to be called once, got %d", inputCount)
+	}
+	
+	// Check output contains "42"
+	found := false
+	for _, o := range out {
+		if strings.Contains(o.Text, "42") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected output containing 42, got %v", out)
+	}
+}
+
+func TestAtTernaryExpression(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+FLAG:12 = 64
+PRINTFORML \@(FLAG:12 & 64) ? yes # no\@
+PRINTFORML \@(FLAG:12 & 1) ? yes # no\@
+FLAG:12 = 0
+PRINTFORML \@(FLAG:12 & 64) ? yes # no\@
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	expected := []string{"yes", "no", "no"}
+	for i, exp := range expected {
+		if i >= len(out) {
+			t.Fatalf("missing output line %d", i)
+		}
+		if !strings.Contains(out[i].Text, exp) {
+			t.Fatalf("output line %d: expected %q in %q", i, exp, out[i].Text)
+		}
+	}
+}
+
+func TestInputProviderWithMenu(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+PRINTLC [1] Option 1
+PRINTLC [2] Option 2
+PRINTL 
+INPUT
+IF RESULT == 1
+    PRINTL You chose 1
+ELSEIF RESULT == 2
+    PRINTL You chose 2
+ELSE
+    PRINTL Invalid choice
+ENDIF
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+
+	// Set up input provider that returns "1"
+	inputCalled := 0
+	vm.SetInputProvider(func(req eruntime.InputRequest) (string, bool, error) {
+		inputCalled++
+		return "1", false, nil
+	})
+
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Check input provider was called
+	if inputCalled != 1 {
+		t.Fatalf("expected input provider to be called once, got %d", inputCalled)
+	}
+
+	// Check output
+	found := false
+	for _, o := range out {
+		if strings.Contains(o.Text, "You chose 1") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected output containing 'You chose 1', got %v", out)
+	}
+}
+
+func TestPrintFormWWithInputProvider(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERB": `
+@TITLE
+PRINTL Before wait
+PRINTFORMW Waiting for input...
+PRINTL After wait
+INPUT
+PRINTVL RESULT
+QUIT
+`,
+	}
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+
+	// Set up input provider
+	waitCalled := 0
+	inputCalled := 0
+	vm.SetInputProvider(func(req eruntime.InputRequest) (string, bool, error) {
+		if req.Command == "WAITANYKEY" {
+			waitCalled++
+		} else if req.Command == "INPUT" {
+			inputCalled++
+			return "42", false, nil
+		}
+		return "", false, nil
+	})
+
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Check that wait was called for PRINTFORMW
+	if waitCalled != 1 {
+		t.Fatalf("expected wait to be called once for PRINTFORMW, got %d", waitCalled)
+	}
+
+	// Check that input was called
+	if inputCalled != 1 {
+		t.Fatalf("expected input to be called once, got %d", inputCalled)
+	}
+
+	// Check output
+	foundBefore := false
+	foundWaiting := false
+	foundAfter := false
+	foundResult := false
+	for _, o := range out {
+		if strings.Contains(o.Text, "Before wait") {
+			foundBefore = true
+		}
+		if strings.Contains(o.Text, "Waiting for input") {
+			foundWaiting = true
+		}
+		if strings.Contains(o.Text, "After wait") {
+			foundAfter = true
+		}
+		if strings.Contains(o.Text, "42") {
+			foundResult = true
+		}
+	}
+	if !foundBefore || !foundWaiting || !foundAfter || !foundResult {
+		t.Fatalf("missing expected output: before=%v waiting=%v after=%v result=%v out=%v", 
+			foundBefore, foundWaiting, foundAfter, foundResult, out)
+	}
+}

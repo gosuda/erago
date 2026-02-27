@@ -6,20 +6,20 @@ import (
 )
 
 type UIState struct {
-	Align       string
-	Color       string
-	BgColor     string
-	FocusColor  string
-	Font        string
-	FontSize    int
-	LineHeight  int
-	Bold        bool
-	Italic      bool
-	SkipDisp    bool
-	Redraw      bool
-	PrintCPL    int64
+	Align        string
+	Color        string
+	BgColor      string
+	FocusColor   string
+	Font         string
+	FontSize     int
+	LineHeight   int
+	Bold         bool
+	Italic       bool
+	SkipDisp     bool
+	Redraw       bool
+	PrintCPL     int64
 	PrintCLength int
-	SaveNos     int
+	SaveNos      int
 }
 
 type RuntimeCharacter struct {
@@ -29,20 +29,21 @@ type RuntimeCharacter struct {
 
 func defaultUIState() UIState {
 	return UIState{
-		Align:       "LEFT",
-		Color:       "FFFFFF",
-		BgColor:     "000000",
-		FocusColor:  "FFFF00",
-		Font:        "",
-		FontSize:    16,
-		LineHeight:  18,
-		Bold:        false,
-		Italic:      false,
-		SkipDisp:    false,
-		Redraw:      true,
-		PrintCPL:    3,
-		PrintCLength: 20,
-		SaveNos:     20,
+		Align:      "LEFT",
+		Color:      "FFFFFF",
+		BgColor:    "000000",
+		FocusColor: "FFFF00",
+		Font:       "",
+		FontSize:   16,
+		LineHeight: 18,
+		Bold:       false,
+		Italic:     false,
+		SkipDisp:   false,
+		Redraw:     true,
+		PrintCPL:   3,
+		// Emuera-compatible default column width used by many eratoho UI scripts.
+		PrintCLength: 27,
+		SaveNos:      20,
 	}
 }
 

@@ -67,11 +67,45 @@ func waitVMEvent(events <-chan tea.Msg) tea.Cmd {
 		return nil
 	}
 	return func() tea.Msg {
-		msg, ok := <-events
-		if !ok {
-			return nil
+		select {
+		case msg, ok := <-events:
+			if !ok {
+				return nil
+			}
+			return msg
+		case <-time.After(20 * time.Millisecond):
+			return vmPollMsg{}
 		}
-		return msg
+	}
+}
+
+func sendInputResp(ch chan vmInputResp, resp vmInputResp) {
+	select {
+	case ch <- resp:
+		return
+	default:
+	}
+	// If a stale response is buffered, replace it with the latest response.
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- resp:
+	default:
+	}
+}
+
+func isEnterKey(msg tea.KeyMsg) bool {
+	k := msg.Key()
+	if k.Code == tea.KeyEnter || k.Code == tea.KeyKpEnter {
+		return true
+	}
+	switch msg.String() {
+	case "enter", "ctrl+m":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -152,6 +186,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendOutput(msg.out)
 		return m, waitVMEvent(m.events)
 
+	case vmPollMsg:
+		if m.running && m.pending == nil {
+			return m, waitVMEvent(m.events)
+		}
+		return m, nil
+
 	case vmPromptMsg:
 		m.seq++
 		m.pending = &pendingInput{
@@ -189,7 +229,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case vmTimeoutMsg:
 		if m.pending != nil && m.pending.seq == msg.seq && m.pending.req.Timed {
-			m.pending.resp <- vmInputResp{value: "", timeout: true}
+			sendInputResp(m.pending.resp, vmInputResp{value: "", timeout: true})
 			m.pending = nil
 			m.input.Blur()
 			m.status = "running"
@@ -210,16 +250,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		if msg.String() == "ctrl+c" {
+		k := msg.Key()
+		if ((k.Code == 'c' || k.Code == 'C') && k.Mod == tea.ModCtrl) || msg.String() == "ctrl+c" {
 			if m.pending != nil {
-				m.pending.resp <- vmInputResp{value: "", timeout: true}
+				sendInputResp(m.pending.resp, vmInputResp{value: "", timeout: true})
 			}
 			return m, tea.Quit
 		}
 
 		if m.pending != nil {
 			if m.pending.isWait {
-				m.pending.resp <- vmInputResp{value: "", timeout: false}
+				sendInputResp(m.pending.resp, vmInputResp{value: "", timeout: false})
 				m.pending = nil
 				m.input.Blur()
 				m.status = "running"
@@ -227,19 +268,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.pending.req.OneInput && msg.Key().Text != "" {
 				val := firstRuneText(msg.Key().Text)
-				m.pending.resp <- vmInputResp{value: val, timeout: false}
+				sendInputResp(m.pending.resp, vmInputResp{value: val, timeout: false})
 				m.pending = nil
 				m.input.Blur()
 				m.input.SetValue("")
 				m.status = "running"
 				return m, waitVMEvent(m.events)
 			}
-			if msg.String() == "enter" {
+			if isEnterKey(msg) {
 				val := strings.TrimSpace(m.input.Value())
 				if !m.pending.req.Numeric && m.pending.req.OneInput {
 					val = firstRuneText(val)
 				}
-				m.pending.resp <- vmInputResp{value: val, timeout: false}
+				sendInputResp(m.pending.resp, vmInputResp{value: val, timeout: false})
 				m.pending = nil
 				m.input.Blur()
 				m.input.SetValue("")

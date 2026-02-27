@@ -27,20 +27,20 @@ type InputRequest struct {
 }
 
 type InputState struct {
-	Phase        InputPhase
-	Current      *InputRequest
-	Queue        []string
-	LastValue    string
-	LastTimeout  bool
-	MouseX       int
-	MouseY       int
-	MouseLeft    bool
-	MouseRight   bool
-	MouseMiddle  bool
-	KeysDown     map[string]bool
+	Phase         InputPhase
+	Current       *InputRequest
+	Queue         []string
+	LastValue     string
+	LastTimeout   bool
+	MouseX        int
+	MouseY        int
+	MouseLeft     bool
+	MouseRight    bool
+	MouseMiddle   bool
+	KeysDown      map[string]bool
 	KeysTriggered map[string]bool
-	ClientWidth  int
-	ClientHeight int
+	ClientWidth   int
+	ClientHeight  int
 }
 
 func defaultInputState() InputState {
@@ -151,6 +151,9 @@ func (vm *VM) maybeEchoInput(text string) {
 }
 
 func (vm *VM) resolveInput(req InputRequest) (string, bool, error) {
+	// New input boundary: reset watchdog so long-running interactive flows
+	// are only flagged when they stop making input progress.
+	vm.execSteps = 0
 	vm.beginInputRequest(req)
 	raw, ok := vm.consumeQueuedInput()
 	if !ok {
