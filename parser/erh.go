@@ -2,10 +2,8 @@ package parser
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/gosuda/erago/ast"
@@ -46,7 +44,7 @@ func ParseERH(files map[string]string, macros map[string]struct{}) (*ERHResult, 
 							// `#DIMS ... = "a", "b"` form: infer 1D length from initializer.
 							// Explicit dimensions keep precedence.
 							if !strings.Contains(declPart, ",") {
-								decl.Dims = []int{maxInt(1, len(splitTopLevel(initPart, ',')))}
+								decl.Dims = []int{max(1, len(splitTopLevel(initPart, ',')))}
 							}
 						}
 						result.StringVars[strings.ToUpper(decl.Name)] = struct{}{}
@@ -64,7 +62,7 @@ func ParseERH(files map[string]string, macros map[string]struct{}) (*ERHResult, 
 								return nil, fmt.Errorf("%s:%d: %w", line.File, line.Number, err)
 							}
 							if !strings.Contains(declPart, ",") {
-								decl.Dims = []int{maxInt(1, len(splitTopLevel(initPart, ',')))}
+								decl.Dims = []int{max(1, len(splitTopLevel(initPart, ',')))}
 							}
 						}
 						result.VarDecls = append(result.VarDecls, decl)
@@ -161,39 +159,4 @@ func addDimInitializers(dst map[string]ast.Expr, name, initRaw string) error {
 		dst[fmt.Sprintf("%s:%d", name, i)] = expr
 	}
 	return nil
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func sortedKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func splitNameAndRest(raw string) (string, string) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", ""
-	}
-	for i, r := range raw {
-		if i == 0 {
-			continue
-		}
-		if unicode.IsSpace(r) {
-			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+utf8.RuneLen(r):])
-		}
-		if !isIdentPart(r) {
-			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+utf8.RuneLen(r):])
-		}
-	}
-	return raw, ""
 }

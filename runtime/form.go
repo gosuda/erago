@@ -3,8 +3,8 @@ package eruntime
 import (
 	"strconv"
 	"strings"
-	"unicode"
 
+	"github.com/gosuda/erago/ast"
 	"github.com/gosuda/erago/parser"
 )
 
@@ -109,6 +109,16 @@ func (vm *VM) evalPercentPlaceholders(tmpl string) (string, error) {
 }
 
 func (vm *VM) evalPercentPlaceholderExpr(raw string) (string, bool, error) {
+	if nested, ok := unwrapNestedAt(raw); ok {
+		repl, handled, err := vm.evalAtPlaceholderExpr(nested)
+		if err != nil {
+			return "", false, err
+		}
+		if handled {
+			return repl, true, nil
+		}
+	}
+
 	expr, err := parser.ParseExpr(raw)
 	if err == nil {
 		v, err := vm.evalExpr(expr)
@@ -299,30 +309,35 @@ func (vm *VM) evalAtPlaceholders(tmpl string) (string, error) {
 }
 
 func (vm *VM) evalAtPlaceholderExpr(raw string) (string, bool, error) {
-	if expr, err := parser.ParseExpr(raw); err == nil {
-		v, err := vm.evalExpr(expr)
+	condRaw, tRaw, fRaw, ok := splitTopLevelTernary(raw)
+	if ok {
+		cond, err := vm.evalLooseExpr(condRaw)
 		if err != nil {
 			return "", false, err
 		}
-		return v.String(), true, nil
+		branch := fRaw
+		if cond.Truthy() {
+			branch = tRaw
+		}
+		text, err := vm.evalAtBranch(strings.TrimSpace(branch))
+		if err != nil {
+			return "", false, err
+		}
+		return text, true, nil
 	}
-	condRaw, tRaw, fRaw, ok := splitTopLevelTernary(raw)
-	if !ok {
+
+	expr, err := parser.ParseExpr(raw)
+	if err != nil {
 		return "", false, nil
 	}
-	cond, err := vm.evalLooseExpr(condRaw)
+	if ref, ok := expr.(ast.VarRef); ok && len(ref.Index) == 0 && !vm.symbolExists(ref.Name) {
+		return raw, true, nil
+	}
+	v, err := vm.evalExpr(expr)
 	if err != nil {
 		return "", false, err
 	}
-	branch := fRaw
-	if cond.Truthy() {
-		branch = tRaw
-	}
-	text, err := vm.evalAtBranch(strings.TrimSpace(branch))
-	if err != nil {
-		return "", false, err
-	}
-	return text, true, nil
+	return v.String(), true, nil
 }
 
 func (vm *VM) evalAtBranch(raw string) (string, error) {
@@ -338,6 +353,9 @@ func (vm *VM) evalAtBranch(raw string) (string, error) {
 		return v.String(), nil
 	}
 	if expr, err := parser.ParseExpr(raw); err == nil {
+		if ref, ok := expr.(ast.VarRef); ok && len(ref.Index) == 0 && !vm.symbolExists(ref.Name) {
+			return raw, nil
+		}
 		v, err := vm.evalExpr(expr)
 		if err != nil {
 			return "", err
@@ -421,6 +439,18 @@ func splitTopLevelTernary(raw string) (cond, onTrue, onFalse string, ok bool) {
 		}
 	}
 	return "", "", "", false
+}
+
+func unwrapNestedAt(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '@' || raw[len(raw)-1] != '@' {
+		return "", false
+	}
+	inner := strings.TrimSpace(raw[1 : len(raw)-1])
+	if inner == "" {
+		return "", false
+	}
+	return inner, true
 }
 
 func findPercentPlaceholderEnd(s string, start int) (int, bool) {
@@ -659,11 +689,6 @@ func findAtPlaceholderEnd(s string, start int) (int, bool) {
 			continue
 		}
 		if ch == '@' {
-			if i > start && !unicode.IsSpace(rune(s[i-1])) {
-				// Prefer escaped form delimiters (`\@...\@`) now surfaced as `@...@`.
-				// If previous char is not whitespace, keep it as plain text.
-				continue
-			}
 			return i, true
 		}
 	}

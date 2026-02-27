@@ -351,12 +351,9 @@ func (vm *VM) callFunction(name string, args []Value) (execResult, error) {
 	}()
 
 	for i, arg := range fn.Args {
+		target := vm.normalizeFuncArgTarget(arg, i)
+
 		assignArg := func(v Value) error {
-			target := arg.Target
-			if strings.TrimSpace(target.Name) == "" {
-				target = ast.VarRef{Name: arg.Name}
-			}
-			target.Name = strings.ToUpper(strings.TrimSpace(target.Name))
 			if len(target.Index) == 0 {
 				fr.locals[target.Name] = v
 				return nil
@@ -367,11 +364,7 @@ func (vm *VM) callFunction(name string, args []Value) (execResult, error) {
 			}
 			arr := fr.lArrays[target.Name]
 			if arr == nil {
-				dims := make([]int, len(index))
-				for j, idx := range index {
-					dims[j] = max(int(idx)+1, 1)
-				}
-				arr = newArrayVar(v.Kind() == StringKind, true, dims)
+				arr = newArrayVar(v.Kind() == StringKind, true, dimsForIndex(index))
 				fr.lArrays[target.Name] = arr
 			}
 			if v.Kind() == StringKind {
@@ -396,7 +389,7 @@ func (vm *VM) callFunction(name string, args []Value) (execResult, error) {
 			}
 			continue
 		}
-		if err := assignArg(Int(0)); err != nil {
+		if err := assignArg(vm.defaultValueForFuncArgTarget(target)); err != nil {
 			return execResult{}, fmt.Errorf("%s arg %s: %w", fn.Name, arg.Name, err)
 		}
 	}
@@ -509,6 +502,16 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 		}
 		if err != nil {
 			return execResult{}, err
+		}
+		if _, isStringExpr := s.Expr.(ast.StringLit); isStringExpr && v.Kind() == StringKind {
+			raw := v.String()
+			if strings.Contains(raw, "%") || strings.Contains(raw, "{") || strings.Contains(raw, "@") {
+				expanded, err := vm.expandFormTemplate(raw)
+				if err != nil {
+					return execResult{}, err
+				}
+				v = Str(expanded)
+			}
 		}
 		current, err := vm.getVarRef(s.Target)
 		if err != nil {
@@ -695,7 +698,7 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 	case ast.CallStmt:
 		args := make([]Value, 0, len(s.Args))
 		for _, e := range s.Args {
-			v, err := vm.evalExpr(e)
+			v, err := vm.evalCallArgExpr(e)
 			if err != nil {
 				return execResult{}, err
 			}
@@ -1237,6 +1240,9 @@ func (vm *VM) evalCommandPrint(name, arg string) (string, error) {
 	if strings.Contains(name, "BUTTON") {
 		return vm.evalPrintButton(arg)
 	}
+	if strings.HasPrefix(name, "PRINTS") || strings.HasPrefix(name, "DEBUGPRINTS") {
+		return vm.evalPrintS(arg)
+	}
 	if strings.Contains(name, "FORMS") {
 		return vm.evalPrintForms(arg)
 	}
@@ -1247,6 +1253,30 @@ func (vm *VM) evalCommandPrint(name, arg string) (string, error) {
 		return vm.evalPrintV(arg)
 	}
 	return decodeCommandCharSeq(arg), nil
+}
+
+func (vm *VM) evalPrintS(arg string) (string, error) {
+	v, err := vm.evalLooseExpr(arg)
+	if err == nil {
+		text := v.String()
+		if v.Kind() == StringKind {
+			if expanded, exErr := vm.expandDecodedTemplate(text); exErr == nil {
+				return expanded, nil
+			}
+		}
+		return text, nil
+	}
+	s := decodeCommandCharSeq(arg)
+	if u, ok := tryUnquoteCommandString(s); ok {
+		if ex, e := vm.expandFormTemplate(u); e == nil {
+			return ex, nil
+		}
+		return u, nil
+	}
+	if ex, e := vm.expandDecodedTemplate(s); e == nil {
+		return ex, nil
+	}
+	return s, nil
 }
 
 func (vm *VM) evalPrintButton(arg string) (string, error) {
@@ -1281,7 +1311,7 @@ func (vm *VM) evalPrintButton(arg string) (string, error) {
 }
 
 func (vm *VM) evalPrintForms(arg string) (string, error) {
-	v, err := vm.evalLooseExpr(arg)
+	v, err := vm.evalCallArgRaw(arg)
 	if err != nil {
 		return "", err
 	}
@@ -1303,7 +1333,7 @@ func (vm *VM) evalPrintV(arg string) (string, error) {
 			b.WriteString(decodeCommandCharSeq(p[1:]))
 			continue
 		}
-		v, err := vm.evalLooseExpr(p)
+		v, err := vm.evalCallArgRaw(p)
 		if err != nil {
 			return "", err
 		}
@@ -3218,6 +3248,9 @@ func csvBaseFromVarName(name string) string {
 	switch name {
 	case "ABL", "BASE", "MARK", "EXP", "RELATION", "TALENT", "CFLAG", "EQUIP", "JUEL", "CSTR":
 		return name
+	case "MAXBASE":
+		// MAXBASE indices use BASE.CSV labels.
+		return "BASE"
 	case "NAME":
 		return "NAME"
 	case "CALLNAME":
@@ -3410,6 +3443,120 @@ func (vm *VM) evalLooseExpr(raw string) (Value, error) {
 	return vm.evalExpr(e)
 }
 
+func looksLikeCallArgExpr(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, "@\"") {
+		return true
+	}
+	return strings.ContainsAny(raw, "%@()?:#{}")
+}
+
+func (vm *VM) evalCallArgExpr(e ast.Expr) (Value, error) {
+	lit, isString := e.(ast.StringLit)
+	if !isString {
+		return vm.evalExpr(e)
+	}
+	raw := lit.Value
+	if !looksLikeCallArgExpr(raw) {
+		return Str(raw), nil
+	}
+	if v, err := vm.evalLooseExpr(raw); err == nil {
+		// parseLooseExpr can silently fall back to a raw string literal.
+		// It also trims outer spaces, so compare in trimmed form.
+		if v.Kind() != StringKind || strings.TrimSpace(v.String()) != strings.TrimSpace(raw) {
+			return v, nil
+		}
+	}
+	if text, ok, err := vm.evalCallArgFormString(raw); err != nil {
+		return Value{}, err
+	} else if ok {
+		return Str(text), nil
+	}
+	if text, err := vm.expandDecodedTemplate(raw); err == nil {
+		return Str(text), nil
+	}
+	return Str(raw), nil
+}
+
+func (vm *VM) evalCallArgFormString(raw string) (string, bool, error) {
+	parts := splitTopLevelRuntime(raw, '+')
+	if len(parts) == 0 {
+		return "", false, nil
+	}
+	var b strings.Builder
+	handled := false
+	for _, p := range parts {
+		part := strings.TrimSpace(p)
+		if part == "" {
+			continue
+		}
+		text, ok, err := vm.evalCallArgFormTerm(part)
+		if err != nil {
+			return "", false, err
+		}
+		if !ok {
+			return "", false, nil
+		}
+		handled = true
+		b.WriteString(text)
+	}
+	if !handled {
+		return "", false, nil
+	}
+	return b.String(), true, nil
+}
+
+func (vm *VM) evalCallArgFormTerm(part string) (string, bool, error) {
+	part = strings.TrimSpace(part)
+	if part == "" {
+		return "", true, nil
+	}
+	if strings.HasPrefix(part, "@\"") && strings.HasSuffix(part, "\"") && len(part) >= 3 {
+		inner := part[2 : len(part)-1]
+		text, err := vm.expandDecodedTemplate(inner)
+		if err != nil {
+			return "", false, err
+		}
+		return text, true, nil
+	}
+	if strings.HasPrefix(part, "@") && strings.HasSuffix(part, "@") && len(part) >= 2 {
+		inner := strings.TrimSpace(part[1 : len(part)-1])
+		if strings.HasSuffix(inner, "#") {
+			inner += ` ""`
+		}
+		text, ok, err := vm.evalAtPlaceholderExpr(inner)
+		if err != nil {
+			return "", false, err
+		}
+		if ok {
+			return text, true, nil
+		}
+	}
+	if uq, ok := tryUnquoteCommandString(part); ok {
+		text, err := vm.expandDecodedTemplate(uq)
+		if err != nil {
+			return "", false, err
+		}
+		return text, true, nil
+	}
+	if v, err := vm.evalLooseExpr(part); err == nil {
+		if v.Kind() != StringKind || v.String() != part {
+			return v.String(), true, nil
+		}
+	}
+	if text, err := vm.expandDecodedTemplate(part); err == nil && text != part {
+		return text, true, nil
+	}
+	return "", false, nil
+}
+
+func (vm *VM) expandDecodedTemplate(raw string) (string, error) {
+	return vm.expandFormTemplate(decodeCommandCharSeq(raw))
+}
+
 func (vm *VM) parseVarRefRuntime(raw string) (ast.VarRef, error) {
 	e, err := parser.ParseExpr(strings.TrimSpace(raw))
 	if err != nil {
@@ -3460,6 +3607,19 @@ func (vm *VM) parseCommandCall(raw string, dynamic bool) (string, []Value, error
 		return "", nil, nil
 	}
 	if dynamic {
+		if targetRaw, argRaw, ok := splitDynamicTargetCall(raw); ok {
+			targetText, err := vm.evalDynamicTarget(targetRaw)
+			if err != nil {
+				return "", nil, err
+			}
+			target := strings.ToUpper(strings.TrimSpace(targetText))
+			args, err := vm.evalDynamicCallArgs(argRaw)
+			if err != nil {
+				return "", nil, err
+			}
+			return target, args, nil
+		}
+
 		parts := splitTopLevelRuntime(raw, ',')
 		if len(parts) == 0 {
 			return "", nil, nil
@@ -3474,7 +3634,7 @@ func (vm *VM) parseCommandCall(raw string, dynamic bool) (string, []Value, error
 			if strings.TrimSpace(p) == "" {
 				continue
 			}
-			v, err := vm.evalLooseExpr(p)
+			v, err := vm.evalCallArgRaw(p)
 			if err != nil {
 				return "", nil, err
 			}
@@ -3486,7 +3646,7 @@ func (vm *VM) parseCommandCall(raw string, dynamic bool) (string, []Value, error
 	if i := strings.Index(raw, "("); i >= 0 && strings.HasSuffix(raw, ")") {
 		target := strings.ToUpper(strings.TrimSpace(raw[:i]))
 		argRaw := strings.TrimSpace(raw[i+1 : len(raw)-1])
-		values, err := vm.evalExprList(argRaw)
+		values, err := vm.evalCallArgList(argRaw)
 		if err != nil {
 			return "", nil, err
 		}
@@ -3503,13 +3663,65 @@ func (vm *VM) parseCommandCall(raw string, dynamic bool) (string, []Value, error
 		if strings.TrimSpace(p) == "" {
 			continue
 		}
-		v, err := vm.evalLooseExpr(p)
+		v, err := vm.evalCallArgRaw(p)
 		if err != nil {
 			return "", nil, err
 		}
 		args = append(args, v)
 	}
 	return target, args, nil
+}
+
+func (vm *VM) evalDynamicCallArgs(argRaw string) ([]Value, error) {
+	argRaw = strings.TrimSpace(argRaw)
+	if argRaw == "" {
+		return nil, nil
+	}
+	values, err := vm.evalCallArgList(argRaw)
+	if err == nil {
+		return values, nil
+	}
+	parts := splitTopLevelRuntime(argRaw, ',')
+	values = make([]Value, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := vm.evalCallArgRaw(p)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, v)
+	}
+	return values, nil
+}
+
+func (vm *VM) evalCallArgList(raw string) ([]Value, error) {
+	exprList, err := parser.ParseExprList(raw)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]Value, 0, len(exprList))
+	for _, e := range exprList {
+		v, err := vm.evalCallArgExpr(e)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, v)
+	}
+	return values, nil
+}
+
+func (vm *VM) evalCallArgRaw(raw string) (Value, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return Str(""), nil
+	}
+	if expr, err := parser.ParseExpr(raw); err == nil {
+		return vm.evalCallArgExpr(expr)
+	}
+	return vm.evalCallArgExpr(ast.StringLit{Value: raw})
 }
 
 func (vm *VM) evalDynamicTarget(raw string) (string, error) {
@@ -3582,6 +3794,54 @@ func splitNameAndRestRuntime(raw string) (string, string) {
 
 func runtimeIdentPart(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '・' || r == '·'
+}
+
+func splitDynamicTargetCall(raw string) (targetRaw string, argRaw string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	inStr := false
+	escape := false
+	depth := 0
+	start := -1
+	for i, r := range raw {
+		if inStr {
+			if escape {
+				escape = false
+				continue
+			}
+			if r == '\\' {
+				escape = true
+				continue
+			}
+			if r == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch r {
+		case '"':
+			inStr = true
+		case '(':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case ')':
+			if depth == 0 {
+				continue
+			}
+			depth--
+			if depth == 0 && start >= 0 {
+				if strings.TrimSpace(raw[i+1:]) != "" {
+					return "", "", false
+				}
+				return strings.TrimSpace(raw[:start]), strings.TrimSpace(raw[start+1 : i]), true
+			}
+		}
+	}
+	return "", "", false
 }
 
 func splitTopLevelRuntime(raw string, sep rune) []string {
@@ -3712,6 +3972,64 @@ func (vm *VM) getVar(name string) Value {
 	return Int(0)
 }
 
+func (vm *VM) isStringArrayBase(name string) bool {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+	if _, ok := vm.program.StringVars[name]; ok {
+		return true
+	}
+	switch name {
+	case "NAME", "CALLNAME", "NICKNAME", "MASTERNAME", "CSTR", "LOCALS", "ARGS", "RESULTS", "GLOBALS":
+		return true
+	default:
+		return false
+	}
+}
+
+func (vm *VM) isCharacterTextBase(name string) bool {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "NAME", "CALLNAME", "NICKNAME", "MASTERNAME":
+		return true
+	default:
+		return false
+	}
+}
+
+func (vm *VM) characterIDByIndex(index int64) (int64, bool) {
+	if index < 0 || index >= int64(len(vm.characters)) {
+		return 0, false
+	}
+	return vm.characters[int(index)].ID, true
+}
+
+func (vm *VM) characterTextFallback(name string, index []int64) (Value, bool) {
+	if !vm.isCharacterTextBase(name) || len(index) == 0 {
+		return Value{}, false
+	}
+	id, ok := vm.characterIDByIndex(index[0])
+	if !ok {
+		return Str(""), true
+	}
+	if v, found := vm.csv.Name(strings.ToUpper(name), id); found {
+		return Str(v), true
+	}
+	return Str(""), true
+}
+
+func arrayHasExplicitValue(arr *ArrayVar, index []int64) bool {
+	if arr == nil {
+		return false
+	}
+	k, err := arr.key(index)
+	if err != nil {
+		return false
+	}
+	_, ok := arr.Data[k]
+	return ok
+}
+
 func (vm *VM) getVarRef(ref ast.VarRef) (Value, error) {
 	name := strings.ToUpper(ref.Name)
 	if len(ref.Index) == 0 {
@@ -3719,6 +4037,18 @@ func (vm *VM) getVarRef(ref ast.VarRef) (Value, error) {
 			return vm.getVarRef(bound)
 		}
 		return vm.getVar(name), nil
+	}
+	if name == "RAND" {
+		limitExpr := ref.Index[0]
+		limitVal, err := vm.evalExpr(limitExpr)
+		if err != nil {
+			return Value{}, err
+		}
+		n := limitVal.Int64()
+		if n <= 0 {
+			return Int(0), nil
+		}
+		return Int(vm.rng.Int63n(n)), nil
 	}
 	index, err := vm.evalIndexExprsFor(name, ref.Index)
 	if err != nil {
@@ -3729,11 +4059,25 @@ func (vm *VM) getVarRef(ref ast.VarRef) (Value, error) {
 			return v, nil
 		}
 	}
+	if name == "NO" && len(index) > 0 {
+		if id, ok := vm.characterIDByIndex(index[0]); ok {
+			return Int(id), nil
+		}
+		return Int(0), nil
+	}
 	if fr := vm.currentFrame(); fr != nil {
 		if arr, ok := fr.lArrays[name]; ok {
 			v, err := arr.Get(index)
 			if err != nil {
+				if arr.IsString && hasNegativeIndex(index) {
+					return Str(""), nil
+				}
 				return Value{}, fmt.Errorf("%s:%v: %w", name, index, err)
+			}
+			if !arrayHasExplicitValue(arr, index) {
+				if fb, ok := vm.characterTextFallback(name, index); ok {
+					return fb, nil
+				}
 			}
 			return v, nil
 		}
@@ -3741,19 +4085,23 @@ func (vm *VM) getVarRef(ref ast.VarRef) (Value, error) {
 	if arr, ok := vm.gArrays[name]; ok {
 		v, err := arr.Get(index)
 		if err != nil {
+			if arr.IsString && hasNegativeIndex(index) {
+				return Str(""), nil
+			}
 			return Value{}, fmt.Errorf("%s:%v: %w", name, index, err)
+		}
+		if !arrayHasExplicitValue(arr, index) {
+			if fb, ok := vm.characterTextFallback(name, index); ok {
+				return fb, nil
+			}
 		}
 		return v, nil
 	}
+	if fb, ok := vm.characterTextFallback(name, index); ok {
+		return fb, nil
+	}
 	if fr := vm.currentFrame(); fr != nil && strings.HasPrefix(name, "LOCAL") {
-		dims := make([]int, len(index))
-		for i, idx := range index {
-			dims[i] = int(idx) + 1
-			if dims[i] < 1 {
-				dims[i] = 1
-			}
-		}
-		arr := newArrayVar(false, true, dims)
+		arr := newArrayVar(vm.isStringArrayBase(name), true, dimsForIndex(index))
 		fr.lArrays[name] = arr
 		v, err := arr.Get(index)
 		if err != nil {
@@ -3761,14 +4109,7 @@ func (vm *VM) getVarRef(ref ast.VarRef) (Value, error) {
 		}
 		return v, nil
 	}
-	dims := make([]int, len(index))
-	for i, idx := range index {
-		dims[i] = int(idx) + 1
-		if dims[i] < 1 {
-			dims[i] = 1
-		}
-	}
-	arr := newArrayVar(false, true, dims)
+	arr := newArrayVar(vm.isStringArrayBase(name), true, dimsForIndex(index))
 	vm.gArrays[name] = arr
 	v, err := arr.Get(index)
 	if err != nil {
@@ -3790,6 +4131,10 @@ func (vm *VM) setVarRef(ref ast.VarRef, v Value) error {
 	if err != nil {
 		return err
 	}
+	if name == "NO" && len(index) > 0 && index[0] >= 0 && index[0] < int64(len(vm.characters)) {
+		vm.characters[int(index[0])].ID = v.Int64()
+		return nil
+	}
 	if fr := vm.currentFrame(); fr != nil {
 		if arr, ok := fr.lArrays[name]; ok {
 			if err := arr.Set(index, v); err != nil {
@@ -3803,15 +4148,7 @@ func (vm *VM) setVarRef(ref ast.VarRef, v Value) error {
 	}
 	arr := vm.gArrays[name]
 	if arr == nil {
-		// Auto-create int array for dynamic use when not declared.
-		dims := make([]int, len(index))
-		for i, idx := range index {
-			dims[i] = int(idx) + 1
-			if dims[i] < 1 {
-				dims[i] = 1
-			}
-		}
-		arr = newArrayVar(false, true, dims)
+		arr = newArrayVar(vm.isStringArrayBase(name), true, dimsForIndex(index))
 		vm.gArrays[name] = arr
 	}
 	if err := arr.Set(index, v); err != nil {
@@ -3857,7 +4194,42 @@ func (vm *VM) defaultValueForVarRef(ref ast.VarRef) (Value, error) {
 	if arr, ok := vm.gArrays[name]; ok {
 		return arr.defaultValue(), nil
 	}
+	if vm.isStringArrayBase(name) {
+		return Str(""), nil
+	}
 	return Int(0), nil
+}
+
+func (vm *VM) normalizeFuncArgTarget(arg ast.Arg, position int) ast.VarRef {
+	target := arg.Target
+	if strings.TrimSpace(target.Name) == "" {
+		target = ast.VarRef{Name: arg.Name}
+	}
+	target.Name = strings.ToUpper(strings.TrimSpace(target.Name))
+	if len(target.Index) == 0 && (target.Name == "ARG" || target.Name == "ARGS") {
+		target.Index = []ast.Expr{ast.IntLit{Value: int64(position)}}
+	}
+	return target
+}
+
+func hasNegativeIndex(index []int64) bool {
+	for _, v := range index {
+		if v < 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (vm *VM) defaultValueForFuncArgTarget(target ast.VarRef) Value {
+	name := strings.ToUpper(strings.TrimSpace(target.Name))
+	if vm.isStringArrayBase(name) {
+		return Str("")
+	}
+	if _, ok := vm.program.StringVars[name]; ok {
+		return Str("")
+	}
+	return Int(0)
 }
 
 func (vm *VM) isRefDeclared(name string) bool {
@@ -3897,8 +4269,21 @@ func (vm *VM) evalIndexExprs(exprs []ast.Expr) ([]int64, error) {
 	return vm.evalIndexExprsFor("", exprs)
 }
 
+func dimsForIndex(index []int64) []int {
+	dims := make([]int, len(index))
+	for i, idx := range index {
+		d := int(idx) + 1
+		if d < 1 {
+			d = 1
+		}
+		dims[i] = d
+	}
+	return dims
+}
+
 func (vm *VM) evalIndexExprsFor(baseName string, exprs []ast.Expr) ([]int64, error) {
 	idx := make([]int64, 0, len(exprs))
+	csvBase := csvBaseFromVarName(baseName)
 	for _, expr := range exprs {
 		if mapped, ok := vm.resolveNamedCSVIndex(baseName, expr); ok {
 			idx = append(idx, mapped)
@@ -3907,6 +4292,10 @@ func (vm *VM) evalIndexExprsFor(baseName string, exprs []ast.Expr) ([]int64, err
 		v, err := vm.evalExpr(expr)
 		if err != nil {
 			return nil, err
+		}
+		if mapped, ok := vm.resolveNamedCSVIndexValue(csvBase, v); ok {
+			idx = append(idx, mapped)
+			continue
 		}
 		idx = append(idx, v.Int64())
 	}
@@ -3930,6 +4319,21 @@ func (vm *VM) resolveNamedCSVIndex(baseName string, expr ast.Expr) (int64, bool)
 		return 0, false
 	}
 	if id, ok := vm.csv.FindID(csvBaseFromVarName(baseName), key); ok {
+		return id, true
+	}
+	return 0, false
+}
+
+func (vm *VM) resolveNamedCSVIndexValue(csvBase string, v Value) (int64, bool) {
+	csvBase = strings.ToUpper(strings.TrimSpace(csvBase))
+	if csvBase == "" || v.Kind() != StringKind {
+		return 0, false
+	}
+	key := strings.TrimSpace(v.String())
+	if key == "" || isNumericLike(key) {
+		return 0, false
+	}
+	if id, ok := vm.csv.FindID(csvBase, key); ok {
 		return id, true
 	}
 	return 0, false
@@ -3983,329 +4387,5 @@ func (vm *VM) storeResult(values []Value) {
 	vm.globals["RESULT"] = values[0]
 	for i, v := range values {
 		vm.globals[fmt.Sprintf("RESULT%d", i)] = v
-	}
-}
-
-func (vm *VM) evalExpr(e ast.Expr) (Value, error) {
-	switch ex := e.(type) {
-	case ast.IntLit:
-		return Int(ex.Value), nil
-	case ast.StringLit:
-		return Str(ex.Value), nil
-	case ast.VarRef:
-		return vm.getVarRef(ex)
-	case ast.UnaryExpr:
-		v, err := vm.evalExpr(ex.Expr)
-		if err != nil {
-			return Value{}, err
-		}
-		switch ex.Op {
-		case "+":
-			return Int(v.Int64()), nil
-		case "-":
-			return Int(-v.Int64()), nil
-		case "!":
-			if v.Truthy() {
-				return Int(0), nil
-			}
-			return Int(1), nil
-		case "~":
-			return Int(^v.Int64()), nil
-		default:
-			return Value{}, fmt.Errorf("unsupported unary operator %q", ex.Op)
-		}
-	case ast.BinaryExpr:
-		left, err := vm.evalExpr(ex.Left)
-		if err != nil {
-			return Value{}, err
-		}
-		right, err := vm.evalExpr(ex.Right)
-		if err != nil {
-			return Value{}, err
-		}
-		return evalBinary(ex.Op, left, right)
-	case ast.TernaryExpr:
-		cond, err := vm.evalExpr(ex.Cond)
-		if err != nil {
-			return Value{}, err
-		}
-		if cond.Truthy() {
-			return vm.evalExpr(ex.True)
-		}
-		return vm.evalExpr(ex.False)
-	case ast.CallExpr:
-		name := strings.ToUpper(strings.TrimSpace(ex.Name))
-		rawExprArg := callExprExprArg(ex.Args)
-		args := make([]Value, 0, len(ex.Args))
-		missing := make([]bool, 0, len(ex.Args))
-		for _, ae := range ex.Args {
-			if _, ok := ae.(ast.EmptyLit); ok {
-				args = append(args, Int(0))
-				missing = append(missing, true)
-				continue
-			}
-			v, err := vm.evalExpr(ae)
-			if err != nil {
-				return Value{}, err
-			}
-			args = append(args, v)
-			missing = append(missing, false)
-		}
-		rawArg := callExprRawArg(args, missing)
-		if shouldPreferMethodLike(name) {
-			if v, handled, err := vm.execMethodLike(name, rawExprArg); handled {
-				return v, err
-			}
-		}
-		if vm.program.Functions[name] != nil {
-			callArgs := make([]Value, 0, len(args))
-			for i, av := range args {
-				if i < len(missing) && missing[i] {
-					break
-				}
-				callArgs = append(callArgs, av)
-			}
-			if _, err := vm.callFunction(name, callArgs); err != nil {
-				if v, handled, mErr := vm.execMethodLike(name, rawExprArg); handled && mErr == nil {
-					return v, nil
-				}
-				return Value{}, err
-			}
-			return vm.getVar("RESULT"), nil
-		}
-		if v, handled, err := vm.execMethodLike(name, rawExprArg); handled {
-			return v, err
-		}
-		if res, err := vm.runCommandStatement(ast.CommandStmt{Name: name, Arg: rawArg}); err == nil {
-			if res.kind == resultNone {
-				return vm.getVar("RESULT"), nil
-			}
-		} else {
-			return Value{}, err
-		}
-		return Value{}, fmt.Errorf("unknown expression call %s", name)
-	case ast.EmptyLit:
-		return Int(0), nil
-	case ast.IncDecExpr:
-		cur, err := vm.getVarRef(ex.Target)
-		if err != nil {
-			return Value{}, err
-		}
-		delta := int64(1)
-		if ex.Op == "--" {
-			delta = -1
-		}
-		next := Int(cur.Int64() + delta)
-		if err := vm.setVarRef(ex.Target, next); err != nil {
-			return Value{}, err
-		}
-		if ex.Post {
-			return cur, nil
-		}
-		return next, nil
-	default:
-		return Value{}, fmt.Errorf("unsupported expression %T", e)
-	}
-}
-
-func shouldPreferMethodLike(name string) bool {
-	switch name {
-	case "HTMLP", "HTMLFONT", "HTMLSTYLE", "HTMLNOBR", "HTMLCOLOR", "HTMLBUTTON", "HTMLAUTOBUTTON", "HTMLNONBUTTON":
-		return true
-	default:
-		return false
-	}
-}
-
-func callExprRawArg(args []Value, missing []bool) string {
-	rawArgs := make([]string, 0, len(args))
-	for i, av := range args {
-		if i < len(missing) && missing[i] {
-			rawArgs = append(rawArgs, "")
-			continue
-		}
-		if av.Kind() == StringKind {
-			rawArgs = append(rawArgs, strconv.Quote(av.String()))
-		} else {
-			rawArgs = append(rawArgs, strconv.FormatInt(av.Int64(), 10))
-		}
-	}
-	return strings.Join(rawArgs, ",")
-}
-
-func callExprExprArg(args []ast.Expr) string {
-	raw := make([]string, 0, len(args))
-	for _, a := range args {
-		if _, ok := a.(ast.EmptyLit); ok {
-			raw = append(raw, "")
-			continue
-		}
-		raw = append(raw, exprToSource(a))
-	}
-	return strings.Join(raw, ",")
-}
-
-func exprToSource(e ast.Expr) string {
-	switch ex := e.(type) {
-	case ast.IntLit:
-		return strconv.FormatInt(ex.Value, 10)
-	case ast.StringLit:
-		return strconv.Quote(ex.Value)
-	case ast.VarRef:
-		var b strings.Builder
-		b.WriteString(strings.ToUpper(ex.Name))
-		for _, idx := range ex.Index {
-			b.WriteString(":")
-			b.WriteString(exprToSource(idx))
-		}
-		return b.String()
-	case ast.UnaryExpr:
-		return ex.Op + "(" + exprToSource(ex.Expr) + ")"
-	case ast.BinaryExpr:
-		return "(" + exprToSource(ex.Left) + " " + ex.Op + " " + exprToSource(ex.Right) + ")"
-	case ast.TernaryExpr:
-		return "(" + exprToSource(ex.Cond) + " ? " + exprToSource(ex.True) + " # " + exprToSource(ex.False) + ")"
-	case ast.CallExpr:
-		return strings.ToUpper(ex.Name) + "(" + callExprExprArg(ex.Args) + ")"
-	case ast.IncDecExpr:
-		name := exprToSource(ex.Target)
-		if ex.Post {
-			return name + ex.Op
-		}
-		return ex.Op + name
-	case ast.EmptyLit:
-		return ""
-	default:
-		return ""
-	}
-}
-
-func evalBinary(op string, left, right Value) (Value, error) {
-	switch op {
-	case "+":
-		if left.Kind() == StringKind || right.Kind() == StringKind {
-			return Str(left.String() + right.String()), nil
-		}
-		return Int(left.Int64() + right.Int64()), nil
-	case "-":
-		return Int(left.Int64() - right.Int64()), nil
-	case "*":
-		return Int(left.Int64() * right.Int64()), nil
-	case "/":
-		if right.Int64() == 0 {
-			return Value{}, fmt.Errorf("division by zero")
-		}
-		return Int(left.Int64() / right.Int64()), nil
-	case "%":
-		if right.Int64() == 0 {
-			return Value{}, fmt.Errorf("modulo by zero")
-		}
-		return Int(left.Int64() % right.Int64()), nil
-	case "<<":
-		return Int(left.Int64() << right.Int64()), nil
-	case ">>":
-		return Int(left.Int64() >> right.Int64()), nil
-	case "&":
-		return Int(left.Int64() & right.Int64()), nil
-	case "|":
-		return Int(left.Int64() | right.Int64()), nil
-	case "^":
-		return Int(left.Int64() ^ right.Int64()), nil
-	case "^^":
-		if left.Truthy() != right.Truthy() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case "==":
-		if left.Kind() == StringKind || right.Kind() == StringKind {
-			if left.String() == right.String() {
-				return Int(1), nil
-			}
-			return Int(0), nil
-		}
-		if left.Int64() == right.Int64() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case "!=":
-		if left.Kind() == StringKind || right.Kind() == StringKind {
-			if left.String() != right.String() {
-				return Int(1), nil
-			}
-			return Int(0), nil
-		}
-		if left.Int64() != right.Int64() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case "<":
-		if left.Int64() < right.Int64() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case "<=":
-		if left.Int64() <= right.Int64() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case ">":
-		if left.Int64() > right.Int64() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case ">=":
-		if left.Int64() >= right.Int64() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case "&&":
-		if left.Truthy() && right.Truthy() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case "!&":
-		if !(left.Truthy() && right.Truthy()) {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case "||":
-		if left.Truthy() || right.Truthy() {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	case "!|":
-		if !(left.Truthy() || right.Truthy()) {
-			return Int(1), nil
-		}
-		return Int(0), nil
-	default:
-		return Value{}, fmt.Errorf("unsupported binary operator %q", op)
-	}
-}
-
-func evalAssignBinary(op string, left, right Value) (Value, error) {
-	switch op {
-	case "+=":
-		return evalBinary("+", left, right)
-	case "-=":
-		return evalBinary("-", left, right)
-	case "*=":
-		return evalBinary("*", left, right)
-	case "/=":
-		return evalBinary("/", left, right)
-	case "%=":
-		return evalBinary("%", left, right)
-	case "&=":
-		return evalBinary("&", left, right)
-	case "|=":
-		return evalBinary("|", left, right)
-	case "^=":
-		return evalBinary("^", left, right)
-	case "<<=":
-		return evalBinary("<<", left, right)
-	case ">>=":
-		return evalBinary(">>", left, right)
-	default:
-		return Value{}, fmt.Errorf("unsupported assignment operator %q", op)
 	}
 }

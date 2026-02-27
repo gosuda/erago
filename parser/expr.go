@@ -118,6 +118,7 @@ func normalizeExprSyntax(raw string) string {
 type exprParser struct {
 	tokens []token
 	pos    int
+	depth  int
 }
 
 func (p *exprParser) peek() token {
@@ -134,6 +135,12 @@ func (p *exprParser) next() token {
 }
 
 func (p *exprParser) parse(minPrec int) (ast.Expr, error) {
+	p.depth++
+	if p.depth > 256 {
+		return nil, fmt.Errorf("expression nesting too deep near token %q", p.peek().lit)
+	}
+	defer func() { p.depth-- }()
+
 	left, err := p.parsePrefix()
 	if err != nil {
 		return nil, err

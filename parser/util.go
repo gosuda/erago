@@ -1,7 +1,10 @@
 package parser
 
 import (
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 func splitTopLevel(raw string, sep rune) []string {
@@ -113,4 +116,32 @@ func decodeCharSeq(raw string) string {
 		b.WriteRune('\\')
 	}
 	return b.String()
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func splitNameAndRest(raw string) (string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	for i, r := range raw {
+		if i == 0 {
+			continue
+		}
+		if unicode.IsSpace(r) {
+			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+utf8.RuneLen(r):])
+		}
+		if !isIdentPart(r) {
+			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+utf8.RuneLen(r):])
+		}
+	}
+	return raw, ""
 }
