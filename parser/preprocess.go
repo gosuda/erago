@@ -9,8 +9,8 @@ type Line struct {
 }
 
 func normalize(raw string) string {
-	if strings.HasPrefix(raw, "\uFEFF") || strings.HasPrefix(raw, "\uFFEF") {
-		return raw[1:]
+	if after, ok := strings.CutPrefix(raw, "\uFEFF"); ok {
+		return after
 	}
 	return raw
 }
@@ -31,9 +31,7 @@ func preprocess(lines []Line, macros map[string]struct{}) []Line {
 	out := make([]Line, 0, len(lines))
 	for _, l := range lines {
 		line := l
-		if idx := strings.Index(line.Content, ";"); idx >= 0 {
-			line.Content = line.Content[:idx]
-		}
+		line.Content = stripComment(line.Content)
 		line.Content = strings.TrimSpace(line.Content)
 		if line.Content == "" {
 			continue
@@ -107,4 +105,60 @@ func concatBraceLines(lines []Line) []Line {
 		i = j
 	}
 	return out
+}
+
+func stripComment(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	rs := []rune(raw)
+	out := make([]rune, 0, len(rs))
+	inString := false
+	verbatim := false
+	escape := false
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		if !inString {
+			if r == '@' && i+1 < len(rs) && rs[i+1] == '"' {
+				inString = true
+				verbatim = true
+				out = append(out, '@', '"')
+				i++
+				continue
+			}
+			if r == '"' {
+				inString = true
+				verbatim = false
+				escape = false
+				out = append(out, r)
+				continue
+			}
+			if r == ';' {
+				break
+			}
+			out = append(out, r)
+			continue
+		}
+
+		out = append(out, r)
+		if verbatim {
+			if r == '"' {
+				inString = false
+				verbatim = false
+			}
+			continue
+		}
+		if escape {
+			escape = false
+			continue
+		}
+		if r == '\\' {
+			escape = true
+			continue
+		}
+		if r == '"' {
+			inString = false
+		}
+	}
+	return string(out)
 }

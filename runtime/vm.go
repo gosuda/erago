@@ -3,6 +3,7 @@ package eruntime
 import (
 	"fmt"
 	"hash/fnv"
+	"html"
 	"math"
 	"math/rand"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gosuda/erago/ast"
 	"github.com/gosuda/erago/parser"
@@ -74,6 +76,8 @@ type execResult struct {
 	values  []Value
 }
 
+var htmlTagPattern = regexp.MustCompile(`(?is)<[^>]*>`)
+
 func New(program *ast.Program) (*VM, error) {
 	vm := &VM{
 		program:        program,
@@ -113,10 +117,16 @@ func (vm *VM) initDefines() error {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	indexedKeys := make([]string, 0, len(keys))
 	for _, k := range keys {
+		if strings.Contains(k, ":") {
+			indexedKeys = append(indexedKeys, k)
+			continue
+		}
 		v, err := vm.evalExpr(vm.program.Defines[k])
 		if err != nil {
-			return fmt.Errorf("define %s: %w", k, err)
+			vm.globals[k] = Int(0)
+			continue
 		}
 		vm.globals[k] = v
 	}
@@ -134,9 +144,47 @@ func (vm *VM) initDefines() error {
 		}
 		vm.gArrays[name] = newArrayVar(decl.IsString, decl.IsDynamic, decl.Dims)
 	}
+	for _, k := range indexedKeys {
+		expr, err := parser.ParseExpr(k)
+		if err != nil {
+			continue
+		}
+		ref, ok := expr.(ast.VarRef)
+		if !ok || len(ref.Index) == 0 {
+			continue
+		}
+		v, err := vm.evalExpr(vm.program.Defines[k])
+		if err != nil {
+			continue
+		}
+		if err := vm.setVarRef(ref, v); err != nil {
+			return fmt.Errorf("init %s: %w", k, err)
+		}
+	}
 	for name := range vm.program.StringVars {
 		if _, ok := vm.globals[name]; !ok && vm.gArrays[name] == nil {
 			vm.globals[name] = Str("")
+		}
+	}
+	title, author, year, windowTitle, info := vm.csv.GameMeta()
+	if strings.TrimSpace(title) != "" {
+		vm.globals["GAMEBASE_TITLE"] = Str(title)
+	}
+	if strings.TrimSpace(author) != "" {
+		vm.globals["GAMEBASE_AUTHOR"] = Str(author)
+	}
+	if strings.TrimSpace(year) != "" {
+		vm.globals["GAMEBASE_YEAR"] = Str(year)
+	}
+	if strings.TrimSpace(windowTitle) != "" {
+		vm.globals["GAMEBASE_WINDOWTITLE"] = Str(windowTitle)
+	}
+	if strings.TrimSpace(info) != "" {
+		vm.globals["GAMEBASE_INFO"] = Str(info)
+	}
+	if _, ok := vm.globals["GAMEBASE_VERSION"]; !ok {
+		if _, version, _, hasVersion := vm.csv.GameCodeVersion(); hasVersion {
+			vm.globals["GAMEBASE_VERSION"] = Int(version)
 		}
 	}
 	if _, ok := vm.globals["RESULT"]; !ok {
@@ -201,7 +249,7 @@ func (vm *VM) Run(entry string) ([]Output, error) {
 		}
 		switch res.kind {
 		case resultBegin:
-			current = strings.ToUpper(res.keyword)
+			current = vm.resolveBeginTarget(res.keyword)
 			continue
 		case resultQuit:
 			return append([]Output(nil), vm.outputs...), nil
@@ -211,6 +259,35 @@ func (vm *VM) Run(entry string) ([]Output, error) {
 			return append([]Output(nil), vm.outputs...), nil
 		}
 	}
+}
+
+func (vm *VM) resolveBeginTarget(keyword string) string {
+	kw := strings.ToUpper(strings.TrimSpace(keyword))
+	candidates := []string{kw}
+	switch kw {
+	case "TITLE":
+		candidates = append(candidates, "SYSTEM_TITLE")
+	case "FIRST":
+		candidates = append(candidates, "EVENTFIRST")
+	case "SHOP":
+		candidates = append(candidates, "EVENTSHOP")
+	case "TRAIN":
+		candidates = append(candidates, "EVENTTRAIN")
+	case "AFTERTRAIN", "AFTERTRA", "END":
+		candidates = append(candidates, "EVENTEND")
+	case "TURNEND":
+		candidates = append(candidates, "EVENTTURNEND")
+	case "COM":
+		candidates = append(candidates, "EVENTCOM")
+	case "LOAD":
+		candidates = append(candidates, "EVENTLOAD")
+	}
+	for _, c := range candidates {
+		if vm.program.Functions[c] != nil {
+			return c
+		}
+	}
+	return kw
 }
 
 func (vm *VM) Globals() map[string]Value {
@@ -274,8 +351,39 @@ func (vm *VM) callFunction(name string, args []Value) (execResult, error) {
 	}()
 
 	for i, arg := range fn.Args {
+		assignArg := func(v Value) error {
+			target := arg.Target
+			if strings.TrimSpace(target.Name) == "" {
+				target = ast.VarRef{Name: arg.Name}
+			}
+			target.Name = strings.ToUpper(strings.TrimSpace(target.Name))
+			if len(target.Index) == 0 {
+				fr.locals[target.Name] = v
+				return nil
+			}
+			index, err := vm.evalIndexExprsFor(target.Name, target.Index)
+			if err != nil {
+				return err
+			}
+			arr := fr.lArrays[target.Name]
+			if arr == nil {
+				dims := make([]int, len(index))
+				for j, idx := range index {
+					dims[j] = max(int(idx)+1, 1)
+				}
+				arr = newArrayVar(v.Kind() == StringKind, true, dims)
+				fr.lArrays[target.Name] = arr
+			}
+			if v.Kind() == StringKind {
+				arr.IsString = true
+			}
+			return arr.Set(index, v)
+		}
+
 		if i < len(args) {
-			fr.locals[arg.Name] = args[i]
+			if err := assignArg(args[i]); err != nil {
+				return execResult{}, fmt.Errorf("%s arg %s: %w", fn.Name, arg.Name, err)
+			}
 			continue
 		}
 		if arg.Default != nil {
@@ -283,10 +391,14 @@ func (vm *VM) callFunction(name string, args []Value) (execResult, error) {
 			if err != nil {
 				return execResult{}, fmt.Errorf("%s default arg %s: %w", fn.Name, arg.Name, err)
 			}
-			fr.locals[arg.Name] = v
+			if err := assignArg(v); err != nil {
+				return execResult{}, fmt.Errorf("%s default arg %s: %w", fn.Name, arg.Name, err)
+			}
 			continue
 		}
-		fr.locals[arg.Name] = Int(0)
+		if err := assignArg(Int(0)); err != nil {
+			return execResult{}, fmt.Errorf("%s arg %s: %w", fn.Name, arg.Name, err)
+		}
 	}
 
 	for _, decl := range fn.VarDecls {
@@ -338,7 +450,14 @@ func (vm *VM) runThunk(thunk *ast.Thunk) (execResult, error) {
 		stmt := thunk.Statements[pc]
 		res, err := vm.runStatement(stmt)
 		if err != nil {
-			return execResult{}, err
+			fnName := ""
+			if fr := vm.currentFrame(); fr != nil && fr.fn != nil {
+				fnName = fr.fn.Name
+			}
+			if fnName == "" {
+				return execResult{}, fmt.Errorf("pc %d (%T): %w", pc, stmt, err)
+			}
+			return execResult{}, fmt.Errorf("%s pc %d (%T): %w", fnName, pc, stmt, err)
 		}
 		if res.kind == resultGoto {
 			idx, ok := thunk.LabelMap[strings.ToUpper(res.label)]
@@ -381,7 +500,13 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 				return execResult{kind: resultNone}, nil
 			}
 		}
-		v, err := vm.evalExpr(s.Expr)
+		var v Value
+		var err error
+		if _, empty := s.Expr.(ast.EmptyLit); empty {
+			v, err = vm.defaultValueForVarRef(s.Target)
+		} else {
+			v, err = vm.evalExpr(s.Expr)
+		}
 		if err != nil {
 			return execResult{}, err
 		}
@@ -526,14 +651,24 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 		if err != nil {
 			return execResult{}, err
 		}
-		varName := strings.ToUpper(s.Var)
+		target := s.Target
+		if strings.TrimSpace(target.Name) == "" {
+			target = ast.VarRef{Name: strings.ToUpper(s.Var)}
+		}
+		target.Name = strings.ToUpper(strings.TrimSpace(target.Name))
 		step := stepVal.Int64()
 		if step == 0 {
 			step = 1
 		}
-		vm.setVar(varName, Int(initVal.Int64()))
+		if err := vm.setVarRef(target, Int(initVal.Int64())); err != nil {
+			return execResult{}, err
+		}
 		for {
-			cur := vm.getVar(varName).Int64()
+			curVal, err := vm.getVarRef(target)
+			if err != nil {
+				return execResult{}, err
+			}
+			cur := curVal.Int64()
 			limit := limitVal.Int64()
 			if (step > 0 && cur >= limit) || (step < 0 && cur <= limit) {
 				return execResult{kind: resultNone}, nil
@@ -551,7 +686,9 @@ func (vm *VM) runStatement(stmt ast.Statement) (execResult, error) {
 			default:
 				return res, nil
 			}
-			vm.setVar(varName, Int(vm.getVar(varName).Int64()+step))
+			if err := vm.setVarRef(target, Int(cur+step)); err != nil {
+				return execResult{}, err
+			}
 		}
 	case ast.GotoStmt:
 		return execResult{kind: resultGoto, label: strings.ToUpper(s.Label)}, nil
@@ -759,6 +896,16 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 		values, err := vm.evalExprList(arg)
 		if err != nil {
 			return execResult{}, err
+		}
+		for i := range values {
+			if values[i].Kind() != StringKind {
+				continue
+			}
+			expanded, err := vm.expandFormTemplate(values[i].String())
+			if err != nil {
+				return execResult{}, err
+			}
+			values[i] = Str(expanded)
 		}
 		return execResult{kind: resultReturn, values: values}, nil
 	case "BEGIN":
@@ -972,7 +1119,38 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 	case "ENDCATCH", "FUNC", "ENDFUNC":
 		vm.globals["RESULT"] = Int(1)
 		return execResult{kind: resultNone}, nil
-	case "RESET_STAIN", "STOPCALLTRAIN", "CBGCLEAR", "CBGCLEARBUTTON", "CBGREMOVEBMAP", "CLEARTEXTBOX", "UPCHECK", "CUPCHECK", "DOTRAIN", "FORCEKANA", "HTML_PRINT", "HTML_TAGSPLIT", "INPUTMOUSEKEY", "TOOLTIP_SETCOLOR", "TOOLTIP_SETDELAY", "TOOLTIP_SETDURATION":
+	case "HTML_PRINT":
+		outText := ""
+		if strings.TrimSpace(arg) != "" {
+			if v, err := vm.evalLooseExpr(arg); err == nil {
+				outText = v.String()
+			} else {
+				outText = decodeCommandCharSeq(arg)
+				if s, ok := tryUnquoteCommandString(outText); ok {
+					outText = s
+				}
+			}
+		}
+		for pass := 0; pass < 6; pass++ {
+			prev := outText
+			if t, err := vm.evalPercentPlaceholders(outText); err == nil {
+				outText = t
+			}
+			if t, err := vm.evalBracePlaceholders(outText); err == nil {
+				outText = t
+			}
+			if outText == prev {
+				break
+			}
+		}
+		outText = html.UnescapeString(outText)
+		outText = htmlTagPattern.ReplaceAllString(outText, "")
+		if strings.TrimSpace(outText) != "" {
+			vm.emitOutput(Output{Text: outText, NewLine: true})
+		}
+		vm.globals["RESULT"] = Int(1)
+		return execResult{kind: resultNone}, nil
+	case "RESET_STAIN", "STOPCALLTRAIN", "CBGCLEAR", "CBGCLEARBUTTON", "CBGREMOVEBMAP", "CLEARTEXTBOX", "UPCHECK", "CUPCHECK", "DOTRAIN", "FORCEKANA", "HTML_TAGSPLIT", "INPUTMOUSEKEY", "TOOLTIP_SETCOLOR", "TOOLTIP_SETDELAY", "TOOLTIP_SETDURATION":
 		vm.globals["RESULT"] = Int(1)
 		return execResult{kind: resultNone}, nil
 	case "SAVEVAR":
@@ -1056,6 +1234,9 @@ func (vm *VM) runCommandStatement(s ast.CommandStmt) (execResult, error) {
 }
 
 func (vm *VM) evalCommandPrint(name, arg string) (string, error) {
+	if strings.Contains(name, "BUTTON") {
+		return vm.evalPrintButton(arg)
+	}
 	if strings.Contains(name, "FORMS") {
 		return vm.evalPrintForms(arg)
 	}
@@ -1066,6 +1247,37 @@ func (vm *VM) evalCommandPrint(name, arg string) (string, error) {
 		return vm.evalPrintV(arg)
 	}
 	return decodeCommandCharSeq(arg), nil
+}
+
+func (vm *VM) evalPrintButton(arg string) (string, error) {
+	parts := splitTopLevelRuntime(arg, ',')
+	if len(parts) == 0 {
+		return "", nil
+	}
+	first := strings.TrimSpace(parts[0])
+	if first == "" {
+		return "", nil
+	}
+	v, err := vm.evalLooseExpr(first)
+	if err == nil {
+		if v.Kind() == StringKind {
+			if s, e := vm.expandFormTemplate(v.String()); e == nil {
+				return s, nil
+			}
+		}
+		return v.String(), nil
+	}
+	s := decodeCommandCharSeq(first)
+	if u, ok := tryUnquoteCommandString(s); ok {
+		if ex, e := vm.expandFormTemplate(u); e == nil {
+			return ex, nil
+		}
+		return u, nil
+	}
+	if ex, e := vm.expandFormTemplate(s); e == nil {
+		return ex, nil
+	}
+	return s, nil
 }
 
 func (vm *VM) evalPrintForms(arg string) (string, error) {
@@ -1265,22 +1477,164 @@ func (vm *VM) execVarSet(arg string) (execResult, error) {
 	if len(parts) < 2 {
 		parts = strings.Fields(arg)
 	}
-	if len(parts) < 2 {
-		return execResult{}, fmt.Errorf("VARSET/CVARSET requires variable and value")
+	if len(parts) < 1 {
+		return execResult{}, fmt.Errorf("VARSET/CVARSET requires variable")
 	}
 	target, err := vm.parseVarRefRuntime(parts[0])
 	if err != nil {
 		return execResult{}, fmt.Errorf("VARSET/CVARSET invalid variable: %w", err)
 	}
+	if len(parts) == 1 {
+		if err := vm.resetVarSetTarget(target); err != nil {
+			return execResult{}, err
+		}
+		vm.globals["RESULT"] = Int(1)
+		return execResult{kind: resultNone}, nil
+	}
+
 	val, err := vm.evalLooseExpr(parts[1])
 	if err != nil {
 		return execResult{}, err
 	}
+
+	if len(parts) >= 3 {
+		startV, err := vm.evalLooseExpr(parts[2])
+		if err != nil {
+			return execResult{}, err
+		}
+		end := startV.Int64()
+		if len(parts) >= 4 {
+			endV, err := vm.evalLooseExpr(parts[3])
+			if err != nil {
+				return execResult{}, err
+			}
+			end = endV.Int64()
+		}
+		if err := vm.varSetRange(target, val, startV.Int64(), end); err != nil {
+			return execResult{}, err
+		}
+		vm.globals["RESULT"] = Int(1)
+		return execResult{kind: resultNone}, nil
+	}
+
 	if err := vm.setVarRef(target, val); err != nil {
 		return execResult{}, err
 	}
 	vm.globals["RESULT"] = Int(1)
 	return execResult{kind: resultNone}, nil
+}
+
+func (vm *VM) resetVarSetTarget(target ast.VarRef) error {
+	name := strings.ToUpper(strings.TrimSpace(target.Name))
+	if name == "" {
+		return nil
+	}
+	if len(target.Index) == 0 {
+		if arr, ok := vm.lookupArray(name); ok {
+			arr.Data = map[string]Value{}
+			if isResultLikeName(name) {
+				vm.globals[name] = arr.defaultValue()
+			}
+			return nil
+		}
+		def, err := vm.defaultValueForVarRef(target)
+		if err != nil {
+			return err
+		}
+		return vm.setVarRef(target, def)
+	}
+
+	prefix, err := vm.evalIndexExprsFor(target.Name, target.Index)
+	if err != nil {
+		return err
+	}
+	if arr, ok := vm.lookupArray(name); ok {
+		vm.clearArrayByPrefix(arr, prefix)
+		return nil
+	}
+	def, err := vm.defaultValueForVarRef(target)
+	if err != nil {
+		return err
+	}
+	return vm.setVarRef(target, def)
+}
+
+func (vm *VM) varSetRange(target ast.VarRef, val Value, start, end int64) error {
+	name := strings.ToUpper(strings.TrimSpace(target.Name))
+	prefix, err := vm.evalIndexExprsFor(target.Name, target.Index)
+	if err != nil {
+		return err
+	}
+	if end < start {
+		start, end = end, start
+	}
+	arr, ok := vm.lookupArray(name)
+	if !ok {
+		dims := make([]int, len(prefix)+1)
+		for i, v := range prefix {
+			d := int(v) + 1
+			if d < 1 {
+				d = 1
+			}
+			dims[i] = d
+		}
+		d := int(end) + 1
+		if d < 1 {
+			d = 1
+		}
+		dims[len(prefix)] = d
+		arr = newArrayVar(val.Kind() == StringKind, true, dims)
+		if fr := vm.currentFrame(); fr != nil && strings.HasPrefix(name, "LOCAL") {
+			fr.lArrays[name] = arr
+		} else {
+			vm.gArrays[name] = arr
+		}
+	}
+	if val.Kind() == StringKind {
+		arr.IsString = true
+	}
+	for i := start; i <= end; i++ {
+		idx := make([]int64, 0, len(prefix)+1)
+		idx = append(idx, prefix...)
+		idx = append(idx, i)
+		if err := arr.Set(idx, val); err != nil {
+			return err
+		}
+	}
+	if isResultLikeName(name) && len(prefix) == 0 && start <= 0 && 0 <= end {
+		vm.globals[name] = val
+	}
+	return nil
+}
+
+func (vm *VM) clearArrayByPrefix(arr *ArrayVar, prefix []int64) {
+	if arr == nil {
+		return
+	}
+	if len(prefix) == 0 {
+		arr.Data = map[string]Value{}
+		return
+	}
+	for k := range arr.Data {
+		if !arrayKeyHasPrefix(k, prefix) {
+			continue
+		}
+		delete(arr.Data, k)
+	}
+}
+
+func arrayKeyHasPrefix(key string, prefix []int64) bool {
+	parts := strings.Split(key, ":")
+	if len(parts) < len(prefix) {
+		return false
+	}
+	for i, want := range prefix {
+		got, err := strconv.ParseInt(parts[i], 10, 64)
+		if err != nil || got != want {
+			return false
+		}
+	}
+	return true
 }
 
 func (vm *VM) execBitMutation(name, arg string) (execResult, error) {
@@ -1396,7 +1750,7 @@ func (vm *VM) execSplit(arg string) (execResult, error) {
 		return execResult{}, err
 	}
 	chunks := strings.Split(valueV.String(), sepV.String())
-	baseIdx, err := vm.evalIndexExprs(dest.Index)
+	baseIdx, err := vm.evalIndexExprsFor(dest.Name, dest.Index)
 	if err != nil {
 		return execResult{}, err
 	}
@@ -1796,11 +2150,6 @@ func (vm *VM) execRedraw(arg string) (execResult, error) {
 		}
 		vm.ui.Redraw = v.Int64() != 0
 	}
-	if vm.ui.Redraw {
-		vm.globals["RESULT"] = Int(1)
-	} else {
-		vm.globals["RESULT"] = Int(0)
-	}
 	return execResult{kind: resultNone}, nil
 }
 
@@ -2072,6 +2421,136 @@ func (vm *VM) execMethodLike(name, arg string) (Value, bool, error) {
 		return Value{}, false, err
 	}
 	switch name {
+	case "HTMLP":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		align := strings.TrimSpace(strings.ToLower(vm.ui.Align))
+		if align == "" {
+			align = "left"
+		}
+		if len(args) >= 2 {
+			a := strings.TrimSpace(strings.ToLower(args[1].String()))
+			switch a {
+			case "", "left", "center", "right":
+				if a != "" {
+					align = a
+				}
+			case "왼쪽":
+				align = "left"
+			case "중앙":
+				align = "center"
+			case "오른쪽":
+				align = "right"
+			}
+		}
+		return Str("<p align='" + align + "'>" + args[0].String() + "</p>"), true, nil
+	case "HTMLFONT":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		text := args[0].String()
+		face := ""
+		color := ""
+		bcolor := ""
+		if len(args) >= 2 {
+			face = strings.TrimSpace(args[1].String())
+		}
+		if len(args) >= 3 {
+			if c := vm.htmlColorFromValue(args[2]); c != "" {
+				color = c
+			}
+		}
+		if len(args) >= 4 {
+			if c := vm.htmlColorFromValue(args[3]); c != "" {
+				bcolor = c
+			}
+		}
+		if face == "" && color == "" && bcolor == "" {
+			face = strings.TrimSpace(vm.ui.Font)
+			if c := vm.htmlColorFromValue(Int(-1)); c != "" {
+				color = c
+			}
+		}
+		var b strings.Builder
+		b.WriteString("<font")
+		if face != "" {
+			b.WriteString(" face='")
+			b.WriteString(face)
+			b.WriteString("'")
+		}
+		if color != "" {
+			b.WriteString(" color='")
+			b.WriteString(color)
+			b.WriteString("'")
+		}
+		if bcolor != "" {
+			b.WriteString(" bcolor='")
+			b.WriteString(bcolor)
+			b.WriteString("'")
+		}
+		b.WriteString(">")
+		b.WriteString(text)
+		b.WriteString("</font>")
+		return Str(b.String()), true, nil
+	case "HTMLNOBR":
+		if len(args) < 1 {
+			return Str("<nobr></nobr>"), true, nil
+		}
+		return Str("<nobr>" + args[0].String() + "</nobr>"), true, nil
+	case "HTMLSTYLE":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		style := int64(0)
+		if vm.ui.Bold {
+			style |= 1
+		}
+		if vm.ui.Italic {
+			style |= 2
+		}
+		if len(args) >= 2 {
+			s := args[1].Int64()
+			if s >= 0 {
+				style = s
+			}
+		}
+		text := args[0].String()
+		open := ""
+		close := ""
+		if style&1 != 0 {
+			open += "<b>"
+			close = "</b>" + close
+		}
+		if style&2 != 0 {
+			open += "<i>"
+			close = "</i>" + close
+		}
+		if style&4 != 0 {
+			open += "<s>"
+			close = "</s>" + close
+		}
+		if style&8 != 0 {
+			open += "<u>"
+			close = "</u>" + close
+		}
+		return Str(open + text + close), true, nil
+	case "HTMLCOLOR":
+		if len(args) < 1 {
+			if c := vm.htmlColorFromValue(Int(-1)); c != "" {
+				return Str(c), true, nil
+			}
+			return Str("FFFFFF"), true, nil
+		}
+		if c := vm.htmlColorFromValue(args[0]); c != "" {
+			return Str(c), true, nil
+		}
+		return Str("FFFFFF"), true, nil
+	case "HTMLBUTTON", "HTMLAUTOBUTTON", "HTMLNONBUTTON":
+		if len(args) < 1 {
+			return Str(""), true, nil
+		}
+		return Str(args[0].String()), true, nil
 	case "SUMARRAY", "SUMCARRAY":
 		return vm.execMethodSumArray(arg), true, nil
 	case "MATCH", "CMATCH":
@@ -2392,6 +2871,18 @@ func (vm *VM) execMethodLike(name, arg string) (Value, bool, error) {
 		if len(args) < 1 {
 			return Int(0), true, nil
 		}
+		if args[0].Kind() != StringKind {
+			if vm.csv.ExistsID(args[0].Int64()) {
+				return Int(1), true, nil
+			}
+			return Int(0), true, nil
+		}
+		if n, err := strconv.ParseInt(strings.TrimSpace(args[0].String()), 10, 64); err == nil {
+			if vm.csv.ExistsID(n) {
+				return Int(1), true, nil
+			}
+			return Int(0), true, nil
+		}
 		if vm.csv.Exists(args[0].String()) {
 			return Int(1), true, nil
 		}
@@ -2415,6 +2906,29 @@ func (vm *VM) execMethodLike(name, arg string) (Value, bool, error) {
 	default:
 		return Value{}, false, nil
 	}
+}
+
+func (vm *VM) htmlColorFromValue(v Value) string {
+	if v.Kind() == StringKind {
+		s := strings.TrimSpace(v.String())
+		s = strings.TrimPrefix(s, "#")
+		if s == "" {
+			return ""
+		}
+		if _, err := strconv.ParseInt(s, 16, 64); err == nil {
+			return strings.ToUpper(s)
+		}
+		return s
+	}
+	n := v.Int64()
+	if n < 0 {
+		c := strings.TrimSpace(strings.TrimPrefix(vm.ui.Color, "#"))
+		if c == "" {
+			return ""
+		}
+		return strings.ToUpper(c)
+	}
+	return strings.ToUpper(fmt.Sprintf("%06X", n&0xFFFFFF))
 }
 
 func (vm *VM) execMethodSumArray(arg string) Value {
@@ -2877,6 +3391,17 @@ func parseLooseExpr(raw string) (ast.Expr, error) {
 	return ast.StringLit{Value: raw}, nil
 }
 
+func tryUnquoteCommandString(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) >= 3 && strings.HasPrefix(raw, "@\"") && strings.HasSuffix(raw, "\"") {
+		return raw[2 : len(raw)-1], true
+	}
+	if v, err := strconv.Unquote(raw); err == nil {
+		return v, true
+	}
+	return "", false
+}
+
 func (vm *VM) evalLooseExpr(raw string) (Value, error) {
 	e, err := parseLooseExpr(raw)
 	if err != nil {
@@ -2919,11 +3444,11 @@ func (vm *VM) evalCommandTarget(raw string, dynamic bool) (string, error) {
 		return "", nil
 	}
 	if dynamic {
-		v, err := vm.evalLooseExpr(raw)
+		target, err := vm.evalDynamicTarget(raw)
 		if err != nil {
 			return "", err
 		}
-		return strings.ToUpper(strings.TrimSpace(v.String())), nil
+		return strings.ToUpper(strings.TrimSpace(target)), nil
 	}
 	cmd, _ := splitNameAndRestRuntime(raw)
 	return strings.ToUpper(strings.TrimSpace(cmd)), nil
@@ -2939,11 +3464,11 @@ func (vm *VM) parseCommandCall(raw string, dynamic bool) (string, []Value, error
 		if len(parts) == 0 {
 			return "", nil, nil
 		}
-		targetVal, err := vm.evalLooseExpr(parts[0])
+		targetText, err := vm.evalDynamicTarget(parts[0])
 		if err != nil {
 			return "", nil, err
 		}
-		target := strings.ToUpper(strings.TrimSpace(targetVal.String()))
+		target := strings.ToUpper(strings.TrimSpace(targetText))
 		args := make([]Value, 0, max(0, len(parts)-1))
 		for _, p := range parts[1:] {
 			if strings.TrimSpace(p) == "" {
@@ -2987,6 +3512,34 @@ func (vm *VM) parseCommandCall(raw string, dynamic bool) (string, []Value, error
 	return target, args, nil
 }
 
+func (vm *VM) evalDynamicTarget(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if v, err := vm.evalLooseExpr(raw); err == nil {
+		s := strings.TrimSpace(v.String())
+		// parseLooseExpr may fallback to raw string; in that case try form expansion.
+		if !(s == raw && (strings.Contains(raw, "%") || strings.Contains(raw, "{"))) {
+			return s, nil
+		}
+	}
+	text := decodeCommandCharSeq(raw)
+	for i := 0; i < 6; i++ {
+		prev := text
+		if t, err := vm.evalPercentPlaceholders(text); err == nil {
+			text = t
+		}
+		if t, err := vm.evalBracePlaceholders(text); err == nil {
+			text = t
+		}
+		if text == prev {
+			break
+		}
+	}
+	return strings.TrimSpace(text), nil
+}
+
 func shouldNewlineOnPrint(name string) bool {
 	if strings.HasPrefix(name, "PRINTL") || strings.HasPrefix(name, "DEBUGPRINTL") {
 		return true
@@ -3012,11 +3565,23 @@ func splitNameAndRestRuntime(raw string) (string, string) {
 		return "", ""
 	}
 	for i, r := range raw {
-		if r == ' ' || r == '\t' {
+		if unicode.IsSpace(r) {
 			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+1:])
 		}
 	}
+	for i, r := range raw {
+		if i == 0 {
+			continue
+		}
+		if !runtimeIdentPart(r) {
+			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i:])
+		}
+	}
 	return raw, ""
+}
+
+func runtimeIdentPart(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '・' || r == '·'
 }
 
 func splitTopLevelRuntime(raw string, sep rune) []string {
@@ -3067,10 +3632,28 @@ func (vm *VM) currentFrame() *frame {
 	return vm.stack[len(vm.stack)-1]
 }
 
+func isResultLikeName(name string) bool {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	return name == "RESULT" || name == "RESULTS"
+}
+
 func (vm *VM) setVar(name string, v Value) {
 	name = strings.ToUpper(name)
 	if bound, ok := vm.resolveRefBinding(name); ok {
 		_ = vm.setVarRef(bound, v)
+		return
+	}
+	if isResultLikeName(name) {
+		vm.globals[name] = v
+		if fr := vm.currentFrame(); fr != nil {
+			if arr, ok := fr.lArrays[name]; ok {
+				_ = arr.Set([]int64{0}, v)
+				return
+			}
+		}
+		if arr, ok := vm.gArrays[name]; ok {
+			_ = arr.Set([]int64{0}, v)
+		}
 		return
 	}
 	if fr := vm.currentFrame(); fr != nil {
@@ -3092,9 +3675,17 @@ func (vm *VM) setVar(name string, v Value) {
 
 func (vm *VM) getVar(name string) Value {
 	name = strings.ToUpper(name)
+	if name == "LINECOUNT" {
+		return Int(int64(len(vm.outputs)))
+	}
 	if bound, ok := vm.resolveRefBinding(name); ok {
 		v, err := vm.getVarRef(bound)
 		if err == nil {
+			return v
+		}
+	}
+	if isResultLikeName(name) {
+		if v, ok := vm.globals[name]; ok {
 			return v
 		}
 	}
@@ -3129,19 +3720,61 @@ func (vm *VM) getVarRef(ref ast.VarRef) (Value, error) {
 		}
 		return vm.getVar(name), nil
 	}
-	index, err := vm.evalIndexExprs(ref.Index)
+	index, err := vm.evalIndexExprsFor(name, ref.Index)
 	if err != nil {
 		return Value{}, err
 	}
+	if isResultLikeName(name) && len(index) == 1 && index[0] == 0 {
+		if v, ok := vm.globals[name]; ok {
+			return v, nil
+		}
+	}
 	if fr := vm.currentFrame(); fr != nil {
 		if arr, ok := fr.lArrays[name]; ok {
-			return arr.Get(index)
+			v, err := arr.Get(index)
+			if err != nil {
+				return Value{}, fmt.Errorf("%s:%v: %w", name, index, err)
+			}
+			return v, nil
 		}
 	}
 	if arr, ok := vm.gArrays[name]; ok {
-		return arr.Get(index)
+		v, err := arr.Get(index)
+		if err != nil {
+			return Value{}, fmt.Errorf("%s:%v: %w", name, index, err)
+		}
+		return v, nil
 	}
-	return Value{}, fmt.Errorf("array variable %s is not declared", name)
+	if fr := vm.currentFrame(); fr != nil && strings.HasPrefix(name, "LOCAL") {
+		dims := make([]int, len(index))
+		for i, idx := range index {
+			dims[i] = int(idx) + 1
+			if dims[i] < 1 {
+				dims[i] = 1
+			}
+		}
+		arr := newArrayVar(false, true, dims)
+		fr.lArrays[name] = arr
+		v, err := arr.Get(index)
+		if err != nil {
+			return Value{}, fmt.Errorf("%s:%v: %w", name, index, err)
+		}
+		return v, nil
+	}
+	dims := make([]int, len(index))
+	for i, idx := range index {
+		dims[i] = int(idx) + 1
+		if dims[i] < 1 {
+			dims[i] = 1
+		}
+	}
+	arr := newArrayVar(false, true, dims)
+	vm.gArrays[name] = arr
+	v, err := arr.Get(index)
+	if err != nil {
+		return Value{}, fmt.Errorf("%s:%v: %w", name, index, err)
+	}
+	return v, nil
 }
 
 func (vm *VM) setVarRef(ref ast.VarRef, v Value) error {
@@ -3153,13 +3786,19 @@ func (vm *VM) setVarRef(ref ast.VarRef, v Value) error {
 		vm.setVar(name, v)
 		return nil
 	}
-	index, err := vm.evalIndexExprs(ref.Index)
+	index, err := vm.evalIndexExprsFor(name, ref.Index)
 	if err != nil {
 		return err
 	}
 	if fr := vm.currentFrame(); fr != nil {
 		if arr, ok := fr.lArrays[name]; ok {
-			return arr.Set(index, v)
+			if err := arr.Set(index, v); err != nil {
+				return fmt.Errorf("%s:%v: %w", name, index, err)
+			}
+			if isResultLikeName(name) && len(index) == 1 && index[0] == 0 {
+				vm.globals[name] = v
+			}
+			return nil
 		}
 	}
 	arr := vm.gArrays[name]
@@ -3175,7 +3814,50 @@ func (vm *VM) setVarRef(ref ast.VarRef, v Value) error {
 		arr = newArrayVar(false, true, dims)
 		vm.gArrays[name] = arr
 	}
-	return arr.Set(index, v)
+	if err := arr.Set(index, v); err != nil {
+		return fmt.Errorf("%s:%v: %w", name, index, err)
+	}
+	if isResultLikeName(name) && len(index) == 1 && index[0] == 0 {
+		vm.globals[name] = v
+	}
+	return nil
+}
+
+func (vm *VM) defaultValueForVarRef(ref ast.VarRef) (Value, error) {
+	name := strings.ToUpper(strings.TrimSpace(ref.Name))
+	if len(ref.Index) == 0 {
+		if fr := vm.currentFrame(); fr != nil {
+			if v, ok := fr.locals[name]; ok {
+				if v.Kind() == StringKind {
+					return Str(""), nil
+				}
+				return Int(0), nil
+			}
+			if arr, ok := fr.lArrays[name]; ok {
+				return arr.defaultValue(), nil
+			}
+		}
+		if arr, ok := vm.gArrays[name]; ok {
+			return arr.defaultValue(), nil
+		}
+		if v, ok := vm.globals[name]; ok && v.Kind() == StringKind {
+			return Str(""), nil
+		}
+		if _, ok := vm.program.StringVars[name]; ok {
+			return Str(""), nil
+		}
+		return Int(0), nil
+	}
+
+	if fr := vm.currentFrame(); fr != nil {
+		if arr, ok := fr.lArrays[name]; ok {
+			return arr.defaultValue(), nil
+		}
+	}
+	if arr, ok := vm.gArrays[name]; ok {
+		return arr.defaultValue(), nil
+	}
+	return Int(0), nil
 }
 
 func (vm *VM) isRefDeclared(name string) bool {
@@ -3212,8 +3894,16 @@ func (vm *VM) resolveRefBinding(name string) (ast.VarRef, bool) {
 }
 
 func (vm *VM) evalIndexExprs(exprs []ast.Expr) ([]int64, error) {
+	return vm.evalIndexExprsFor("", exprs)
+}
+
+func (vm *VM) evalIndexExprsFor(baseName string, exprs []ast.Expr) ([]int64, error) {
 	idx := make([]int64, 0, len(exprs))
 	for _, expr := range exprs {
+		if mapped, ok := vm.resolveNamedCSVIndex(baseName, expr); ok {
+			idx = append(idx, mapped)
+			continue
+		}
 		v, err := vm.evalExpr(expr)
 		if err != nil {
 			return nil, err
@@ -3221,6 +3911,68 @@ func (vm *VM) evalIndexExprs(exprs []ast.Expr) ([]int64, error) {
 		idx = append(idx, v.Int64())
 	}
 	return idx, nil
+}
+
+func (vm *VM) resolveNamedCSVIndex(baseName string, expr ast.Expr) (int64, bool) {
+	baseName = strings.ToUpper(strings.TrimSpace(baseName))
+	if baseName == "" {
+		return 0, false
+	}
+	ref, ok := expr.(ast.VarRef)
+	if !ok || len(ref.Index) != 0 {
+		return 0, false
+	}
+	key := strings.TrimSpace(ref.Name)
+	if key == "" {
+		return 0, false
+	}
+	if vm.symbolExists(key) {
+		return 0, false
+	}
+	if id, ok := vm.csv.FindID(csvBaseFromVarName(baseName), key); ok {
+		return id, true
+	}
+	return 0, false
+}
+
+func (vm *VM) symbolExists(name string) bool {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+	if _, ok := vm.resolveRefBinding(name); ok {
+		return true
+	}
+	if fr := vm.currentFrame(); fr != nil {
+		if _, ok := fr.locals[name]; ok {
+			return true
+		}
+		if _, ok := fr.lArrays[name]; ok {
+			return true
+		}
+		if fr.lRefDecl[name] {
+			return true
+		}
+		if _, ok := fr.refs[name]; ok {
+			return true
+		}
+	}
+	if _, ok := vm.globals[name]; ok {
+		return true
+	}
+	if _, ok := vm.gArrays[name]; ok {
+		return true
+	}
+	if vm.gRefDecl[name] {
+		return true
+	}
+	if _, ok := vm.gRefs[name]; ok {
+		return true
+	}
+	if _, ok := vm.program.StringVars[name]; ok {
+		return true
+	}
+	return false
 }
 
 func (vm *VM) storeResult(values []Value) {
@@ -3272,8 +4024,159 @@ func (vm *VM) evalExpr(e ast.Expr) (Value, error) {
 			return Value{}, err
 		}
 		return evalBinary(ex.Op, left, right)
+	case ast.TernaryExpr:
+		cond, err := vm.evalExpr(ex.Cond)
+		if err != nil {
+			return Value{}, err
+		}
+		if cond.Truthy() {
+			return vm.evalExpr(ex.True)
+		}
+		return vm.evalExpr(ex.False)
+	case ast.CallExpr:
+		name := strings.ToUpper(strings.TrimSpace(ex.Name))
+		rawExprArg := callExprExprArg(ex.Args)
+		args := make([]Value, 0, len(ex.Args))
+		missing := make([]bool, 0, len(ex.Args))
+		for _, ae := range ex.Args {
+			if _, ok := ae.(ast.EmptyLit); ok {
+				args = append(args, Int(0))
+				missing = append(missing, true)
+				continue
+			}
+			v, err := vm.evalExpr(ae)
+			if err != nil {
+				return Value{}, err
+			}
+			args = append(args, v)
+			missing = append(missing, false)
+		}
+		rawArg := callExprRawArg(args, missing)
+		if shouldPreferMethodLike(name) {
+			if v, handled, err := vm.execMethodLike(name, rawExprArg); handled {
+				return v, err
+			}
+		}
+		if vm.program.Functions[name] != nil {
+			callArgs := make([]Value, 0, len(args))
+			for i, av := range args {
+				if i < len(missing) && missing[i] {
+					break
+				}
+				callArgs = append(callArgs, av)
+			}
+			if _, err := vm.callFunction(name, callArgs); err != nil {
+				if v, handled, mErr := vm.execMethodLike(name, rawExprArg); handled && mErr == nil {
+					return v, nil
+				}
+				return Value{}, err
+			}
+			return vm.getVar("RESULT"), nil
+		}
+		if v, handled, err := vm.execMethodLike(name, rawExprArg); handled {
+			return v, err
+		}
+		if res, err := vm.runCommandStatement(ast.CommandStmt{Name: name, Arg: rawArg}); err == nil {
+			if res.kind == resultNone {
+				return vm.getVar("RESULT"), nil
+			}
+		} else {
+			return Value{}, err
+		}
+		return Value{}, fmt.Errorf("unknown expression call %s", name)
+	case ast.EmptyLit:
+		return Int(0), nil
+	case ast.IncDecExpr:
+		cur, err := vm.getVarRef(ex.Target)
+		if err != nil {
+			return Value{}, err
+		}
+		delta := int64(1)
+		if ex.Op == "--" {
+			delta = -1
+		}
+		next := Int(cur.Int64() + delta)
+		if err := vm.setVarRef(ex.Target, next); err != nil {
+			return Value{}, err
+		}
+		if ex.Post {
+			return cur, nil
+		}
+		return next, nil
 	default:
 		return Value{}, fmt.Errorf("unsupported expression %T", e)
+	}
+}
+
+func shouldPreferMethodLike(name string) bool {
+	switch name {
+	case "HTMLP", "HTMLFONT", "HTMLSTYLE", "HTMLNOBR", "HTMLCOLOR", "HTMLBUTTON", "HTMLAUTOBUTTON", "HTMLNONBUTTON":
+		return true
+	default:
+		return false
+	}
+}
+
+func callExprRawArg(args []Value, missing []bool) string {
+	rawArgs := make([]string, 0, len(args))
+	for i, av := range args {
+		if i < len(missing) && missing[i] {
+			rawArgs = append(rawArgs, "")
+			continue
+		}
+		if av.Kind() == StringKind {
+			rawArgs = append(rawArgs, strconv.Quote(av.String()))
+		} else {
+			rawArgs = append(rawArgs, strconv.FormatInt(av.Int64(), 10))
+		}
+	}
+	return strings.Join(rawArgs, ",")
+}
+
+func callExprExprArg(args []ast.Expr) string {
+	raw := make([]string, 0, len(args))
+	for _, a := range args {
+		if _, ok := a.(ast.EmptyLit); ok {
+			raw = append(raw, "")
+			continue
+		}
+		raw = append(raw, exprToSource(a))
+	}
+	return strings.Join(raw, ",")
+}
+
+func exprToSource(e ast.Expr) string {
+	switch ex := e.(type) {
+	case ast.IntLit:
+		return strconv.FormatInt(ex.Value, 10)
+	case ast.StringLit:
+		return strconv.Quote(ex.Value)
+	case ast.VarRef:
+		var b strings.Builder
+		b.WriteString(strings.ToUpper(ex.Name))
+		for _, idx := range ex.Index {
+			b.WriteString(":")
+			b.WriteString(exprToSource(idx))
+		}
+		return b.String()
+	case ast.UnaryExpr:
+		return ex.Op + "(" + exprToSource(ex.Expr) + ")"
+	case ast.BinaryExpr:
+		return "(" + exprToSource(ex.Left) + " " + ex.Op + " " + exprToSource(ex.Right) + ")"
+	case ast.TernaryExpr:
+		return "(" + exprToSource(ex.Cond) + " ? " + exprToSource(ex.True) + " # " + exprToSource(ex.False) + ")"
+	case ast.CallExpr:
+		return strings.ToUpper(ex.Name) + "(" + callExprExprArg(ex.Args) + ")"
+	case ast.IncDecExpr:
+		name := exprToSource(ex.Target)
+		if ex.Post {
+			return name + ex.Op
+		}
+		return ex.Op + name
+	case ast.EmptyLit:
+		return ""
+	default:
+		return ""
 	}
 }
 
@@ -3308,6 +4211,11 @@ func evalBinary(op string, left, right Value) (Value, error) {
 		return Int(left.Int64() | right.Int64()), nil
 	case "^":
 		return Int(left.Int64() ^ right.Int64()), nil
+	case "^^":
+		if left.Truthy() != right.Truthy() {
+			return Int(1), nil
+		}
+		return Int(0), nil
 	case "==":
 		if left.Kind() == StringKind || right.Kind() == StringKind {
 			if left.String() == right.String() {
@@ -3355,8 +4263,18 @@ func evalBinary(op string, left, right Value) (Value, error) {
 			return Int(1), nil
 		}
 		return Int(0), nil
+	case "!&":
+		if !(left.Truthy() && right.Truthy()) {
+			return Int(1), nil
+		}
+		return Int(0), nil
 	case "||":
 		if left.Truthy() || right.Truthy() {
+			return Int(1), nil
+		}
+		return Int(0), nil
+	case "!|":
+		if !(left.Truthy() || right.Truthy()) {
 			return Int(1), nil
 		}
 		return Int(0), nil
@@ -3383,6 +4301,10 @@ func evalAssignBinary(op string, left, right Value) (Value, error) {
 		return evalBinary("|", left, right)
 	case "^=":
 		return evalBinary("^", left, right)
+	case "<<=":
+		return evalBinary("<<", left, right)
+	case ">>=":
+		return evalBinary(">>", left, right)
 	default:
 		return Value{}, fmt.Errorf("unsupported assignment operator %q", op)
 	}

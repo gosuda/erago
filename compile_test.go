@@ -343,6 +343,43 @@ QUIT
 	}
 }
 
+func TestCSVNamedIndexInArrayAccess(t *testing.T) {
+	files := map[string]string{
+		"MAIN.ERH": `
+#DIM FLAG, 32
+`,
+		"MAIN.ERB": `
+@TITLE
+FLAG:MODE = 7
+FLAG:CHARA_TOTAL = 11
+PRINTVL FLAG:5
+PRINTVL FLAG:8
+PRINTVL FLAG:MODE
+PRINTVL FLAG:CHARA_TOTAL
+QUIT
+`,
+		"FLAG.CSV": `
+5,MODE
+8,CHARA_TOTAL
+`,
+	}
+
+	vm, err := erago.Compile(files)
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	out, err := vm.Run("TITLE")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(out) != 4 {
+		t.Fatalf("unexpected output count: %d", len(out))
+	}
+	if out[0].Text != "7" || out[1].Text != "11" || out[2].Text != "7" || out[3].Text != "11" {
+		t.Fatalf("unexpected CSV named index behavior: %+v", out)
+	}
+}
+
 func TestSaveLoadIncludesArrays(t *testing.T) {
 	files := map[string]string{
 		"MAIN.ERH": `

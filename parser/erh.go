@@ -3,7 +3,10 @@ package parser
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gosuda/erago/ast"
 )
@@ -32,16 +35,38 @@ func ParseERH(files map[string]string, macros map[string]struct{}) (*ERHResult, 
 			upper := strings.ToUpper(content)
 			if !strings.HasPrefix(upper, "DEFINE") {
 				if strings.HasPrefix(upper, "DIMS ") {
-					decl, ok := parseDimDecl(content[len("DIMS"):], true, "global")
+					declRaw := strings.TrimSpace(content[len("DIMS"):])
+					declPart, initPart := splitDimDeclAndInit(declRaw)
+					decl, ok := parseDimDecl(declPart, true, "global")
 					if ok {
+						if initPart != "" {
+							if err := addDimInitializers(result.Defines, decl.Name, initPart); err != nil {
+								return nil, fmt.Errorf("%s:%d: %w", line.File, line.Number, err)
+							}
+							// `#DIMS ... = "a", "b"` form: infer 1D length from initializer.
+							// Explicit dimensions keep precedence.
+							if !strings.Contains(declPart, ",") {
+								decl.Dims = []int{maxInt(1, len(splitTopLevel(initPart, ',')))}
+							}
+						}
 						result.StringVars[strings.ToUpper(decl.Name)] = struct{}{}
 						result.VarDecls = append(result.VarDecls, decl)
 					}
 					continue
 				}
 				if strings.HasPrefix(upper, "DIM ") {
-					decl, ok := parseDimDecl(content[len("DIM"):], false, "global")
+					declRaw := strings.TrimSpace(content[len("DIM"):])
+					declPart, initPart := splitDimDeclAndInit(declRaw)
+					decl, ok := parseDimDecl(declPart, false, "global")
 					if ok {
+						if initPart != "" {
+							if err := addDimInitializers(result.Defines, decl.Name, initPart); err != nil {
+								return nil, fmt.Errorf("%s:%d: %w", line.File, line.Number, err)
+							}
+							if !strings.Contains(declPart, ",") {
+								decl.Dims = []int{maxInt(1, len(splitTopLevel(initPart, ',')))}
+							}
+						}
 						result.VarDecls = append(result.VarDecls, decl)
 					}
 					continue
@@ -72,6 +97,79 @@ func ParseERH(files map[string]string, macros map[string]struct{}) (*ERHResult, 
 	return result, nil
 }
 
+func splitDimDeclAndInit(raw string) (declPart string, initPart string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	depth := 0
+	inStr := false
+	escape := false
+	for i, r := range raw {
+		if inStr {
+			if escape {
+				escape = false
+				continue
+			}
+			if r == '\\' {
+				escape = true
+				continue
+			}
+			if r == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch r {
+		case '"':
+			inStr = true
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '=':
+			if depth == 0 {
+				return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+utf8.RuneLen(r):])
+			}
+		}
+	}
+	return raw, ""
+}
+
+func addDimInitializers(dst map[string]ast.Expr, name, initRaw string) error {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if name == "" {
+		return nil
+	}
+	parts := splitTopLevel(initRaw, ',')
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		expr, err := ParseExpr(p)
+		if err != nil {
+			// keep compatibility with old parser behavior for bare numerics/strings
+			if n, convErr := strconv.ParseInt(p, 10, 64); convErr == nil {
+				expr = ast.IntLit{Value: n}
+			} else {
+				expr = ast.StringLit{Value: strings.Trim(p, "\"")}
+			}
+		}
+		dst[fmt.Sprintf("%s:%d", name, i)] = expr
+	}
+	return nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func sortedKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -87,8 +185,14 @@ func splitNameAndRest(raw string) (string, string) {
 		return "", ""
 	}
 	for i, r := range raw {
-		if r == ' ' || r == '\t' {
-			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+1:])
+		if i == 0 {
+			continue
+		}
+		if unicode.IsSpace(r) {
+			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+utf8.RuneLen(r):])
+		}
+		if !isIdentPart(r) {
+			return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+utf8.RuneLen(r):])
 		}
 	}
 	return raw, ""

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gosuda/erago/ast"
 )
@@ -28,8 +29,12 @@ func ParseERB(files map[string]string, macros map[string]struct{}) (*ERBResult, 
 			if err != nil {
 				return nil, err
 			}
-			if _, exists := result.Functions[fn.Name]; exists {
-				return nil, fmt.Errorf("%s:%d: duplicate function %s", lines[i].File, lines[i].Number, fn.Name)
+			if existing, exists := result.Functions[fn.Name]; exists {
+				if err := mergeDuplicateFunction(existing, fn); err != nil {
+					return nil, fmt.Errorf("%s:%d: duplicate function %s: %w", lines[i].File, lines[i].Number, fn.Name, err)
+				}
+				i += consumed
+				continue
 			}
 			result.Functions[fn.Name] = fn
 			result.Order = append(result.Order, fn.Name)
@@ -37,6 +42,37 @@ func ParseERB(files map[string]string, macros map[string]struct{}) (*ERBResult, 
 		}
 	}
 	return result, nil
+}
+
+func mergeDuplicateFunction(dst, src *ast.Function) error {
+	if dst == nil || src == nil {
+		return nil
+	}
+	if len(dst.Args) != len(src.Args) {
+		return fmt.Errorf("argument count mismatch (%d vs %d)", len(dst.Args), len(src.Args))
+	}
+	for i := range dst.Args {
+		if dst.Args[i].Name != src.Args[i].Name {
+			return fmt.Errorf("argument mismatch at %d (%s vs %s)", i, dst.Args[i].Name, src.Args[i].Name)
+		}
+	}
+	if dst.Body == nil {
+		dst.Body = &ast.Thunk{Statements: nil, LabelMap: map[string]int{}}
+	}
+	if dst.Body.LabelMap == nil {
+		dst.Body.LabelMap = map[string]int{}
+	}
+	if src.Body == nil {
+		dst.VarDecls = append(dst.VarDecls, src.VarDecls...)
+		return nil
+	}
+	offset := len(dst.Body.Statements)
+	dst.Body.Statements = append(dst.Body.Statements, src.Body.Statements...)
+	for name, idx := range src.Body.LabelMap {
+		dst.Body.LabelMap[name] = idx + offset
+	}
+	dst.VarDecls = append(dst.VarDecls, src.VarDecls...)
+	return nil
 }
 
 func parseFunction(lines []Line, from int) (*ast.Function, int, error) {
@@ -116,10 +152,10 @@ func parseArgs(raw string) ([]ast.Arg, error) {
 		if part == "" {
 			continue
 		}
-		name := part
+		nameRaw := strings.TrimSpace(part)
 		var def ast.Expr
 		if idx := strings.Index(part, "="); idx >= 0 {
-			name = strings.TrimSpace(part[:idx])
+			nameRaw = strings.TrimSpace(part[:idx])
 			exprRaw := strings.TrimSpace(part[idx+1:])
 			e, err := ParseExpr(exprRaw)
 			if err != nil {
@@ -127,11 +163,15 @@ func parseArgs(raw string) ([]ast.Arg, error) {
 			}
 			def = e
 		}
-		name = strings.ToUpper(strings.TrimSpace(name))
-		if !isIdentifier(name) {
-			return nil, fmt.Errorf("invalid argument name %q", name)
+		target, err := parseVarRefText(nameRaw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid argument name %q: %w", nameRaw, err)
 		}
-		args = append(args, ast.Arg{Name: name, Default: def})
+		if strings.TrimSpace(target.Name) == "" {
+			return nil, fmt.Errorf("invalid argument name %q", nameRaw)
+		}
+		target.Name = strings.ToUpper(strings.TrimSpace(target.Name))
+		args = append(args, ast.Arg{Name: target.Name, Target: target, Default: def})
 	}
 	return args, nil
 }
@@ -207,6 +247,11 @@ func parseStatement(lines []Line, index int) (ast.Statement, int, error) {
 		return stmt, consumed, nil
 	}
 	cmd, rest := splitNameAndRest(content)
+	if !isKnownCommand(strings.ToUpper(cmd)) {
+		if knownCmd, knownRest, ok := splitKnownCommandPrefix(content); ok {
+			cmd, rest = knownCmd, knownRest
+		}
+	}
 	switch strings.ToUpper(cmd) {
 	case "PRINT":
 		e, err := parsePrintExpr(rest)
@@ -309,9 +354,19 @@ func parseStatement(lines []Line, index int) (ast.Statement, int, error) {
 	}
 
 	if assign := splitAssign(content); assign != nil {
-		e, err := ParseExpr(assign.Right)
-		if err != nil {
-			return nil, 0, fmt.Errorf("%s:%d: %w", line.File, line.Number, err)
+		if assign.Op == "'=" {
+			assign.Op = "="
+		}
+		var e ast.Expr
+		if strings.TrimSpace(assign.Right) == "" {
+			e = ast.EmptyLit{}
+		} else {
+			parsed, err := ParseExpr(assign.Right)
+			if err != nil {
+				e = ast.StringLit{Value: decodeCharSeq(strings.TrimSpace(assign.Right))}
+			} else {
+				e = parsed
+			}
 		}
 		target, err := parseVarRefText(assign.Left)
 		if err != nil {
@@ -327,7 +382,44 @@ func parseStatement(lines []Line, index int) (ast.Statement, int, error) {
 		return ast.CallStmt{Name: name, Args: args}, 1, nil
 	}
 
+	if isIdentifier(strings.ToUpper(cmd)) {
+		return ast.CommandStmt{
+			Name: strings.ToUpper(cmd),
+			Arg:  strings.TrimSpace(rest),
+		}, 1, nil
+	}
+
 	return nil, 0, fmt.Errorf("%s:%d: unsupported statement %q", line.File, line.Number, content)
+}
+
+func splitKnownCommandPrefix(raw string) (string, string, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(raw))
+	best := ""
+	for cmd := range knownCommands {
+		if !strings.HasPrefix(upper, cmd) {
+			continue
+		}
+		if len(upper) == len(cmd) {
+			if len(cmd) > len(best) {
+				best = cmd
+			}
+			continue
+		}
+		rest := raw[len(cmd):]
+		r, _ := utf8.DecodeRuneInString(rest)
+		if r == utf8.RuneError && len(rest) > 0 {
+			continue
+		}
+		if !isIdentPart(r) {
+			if len(cmd) > len(best) {
+				best = cmd
+			}
+		}
+	}
+	if best == "" {
+		return "", "", false
+	}
+	return best, strings.TrimSpace(raw[len(best):]), true
 }
 
 func parseWhile(lines []Line, from int) (ast.Statement, int, error) {
@@ -398,9 +490,13 @@ func parseFor(lines []Line, from int) (ast.Statement, int, error) {
 	if len(parts) < 3 || len(parts) > 4 {
 		return nil, 0, fmt.Errorf("%s:%d: FOR requires 3 or 4 arguments", line.File, line.Number)
 	}
-	varName := strings.ToUpper(strings.TrimSpace(parts[0]))
-	if !isIdentifier(varName) {
-		return nil, 0, fmt.Errorf("%s:%d: invalid FOR variable %q", line.File, line.Number, varName)
+	target, err := parseVarRefText(parts[0])
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s:%d: invalid FOR variable %q", line.File, line.Number, strings.TrimSpace(parts[0]))
+	}
+	target.Name = strings.ToUpper(strings.TrimSpace(target.Name))
+	if target.Name == "" {
+		return nil, 0, fmt.Errorf("%s:%d: invalid FOR variable %q", line.File, line.Number, strings.TrimSpace(parts[0]))
 	}
 	initExpr, err := ParseExpr(parts[1])
 	if err != nil {
@@ -427,11 +523,12 @@ func parseFor(lines []Line, from int) (ast.Statement, int, error) {
 		return nil, 0, fmt.Errorf("%s:%d: FOR without NEXT", line.File, line.Number)
 	}
 	return ast.ForStmt{
-		Var:   varName,
-		Init:  initExpr,
-		Limit: limitExpr,
-		Step:  stepExpr,
-		Body:  thunk,
+		Var:    target.Name,
+		Target: target,
+		Init:   initExpr,
+		Limit:  limitExpr,
+		Step:   stepExpr,
+		Body:   thunk,
 	}, consumed + 2, nil
 }
 
@@ -505,7 +602,7 @@ func parseCaseConditions(raw string) ([]ast.CaseCondition, error) {
 		if strings.HasPrefix(upper, "IS ") {
 			rest := strings.TrimSpace(p[len("IS"):])
 			op := ""
-			for _, candidate := range []string{"<=", ">=", "<", ">"} {
+			for _, candidate := range []string{"==", "!=", "<=", ">=", "<", ">"} {
 				if strings.HasPrefix(strings.TrimSpace(rest), candidate) {
 					op = candidate
 					rest = strings.TrimSpace(rest[len(candidate):])
@@ -707,19 +804,34 @@ func parseCall(raw string) (string, []ast.Expr, error) {
 		return "", nil, fmt.Errorf("missing call target")
 	}
 	if i := strings.Index(raw, "("); i >= 0 {
-		if !strings.HasSuffix(raw, ")") {
-			return "", nil, fmt.Errorf("invalid call syntax")
+		comma := strings.Index(raw, ",")
+		if comma >= 0 && comma < i {
+			i = -1
 		}
-		name := strings.ToUpper(strings.TrimSpace(raw[:i]))
-		argRaw := strings.TrimSpace(raw[i+1 : len(raw)-1])
-		if !isIdentifier(name) {
-			return "", nil, fmt.Errorf("invalid function name %q", name)
+		if i >= 0 {
+			if !strings.HasSuffix(raw, ")") {
+				return "", nil, fmt.Errorf("invalid call syntax")
+			}
+			name := strings.ToUpper(strings.TrimSpace(raw[:i]))
+			argRaw := strings.TrimSpace(raw[i+1 : len(raw)-1])
+			if !isIdentifier(name) {
+				return "", nil, fmt.Errorf("invalid function name %q", name)
+			}
+			args, err := ParseExprList(argRaw)
+			if err != nil {
+				parts := splitTopLevel(argRaw, ',')
+				args = make([]ast.Expr, 0, len(parts))
+				for _, p := range parts {
+					p = strings.TrimSpace(p)
+					if p == "" {
+						args = append(args, ast.EmptyLit{})
+						continue
+					}
+					args = append(args, ast.StringLit{Value: decodeCharSeq(p)})
+				}
+			}
+			return name, args, nil
 		}
-		args, err := ParseExprList(argRaw)
-		if err != nil {
-			return "", nil, err
-		}
-		return name, args, nil
 	}
 	parts := splitTopLevel(raw, ',')
 	if len(parts) == 0 {
@@ -731,12 +843,15 @@ func parseCall(raw string) (string, []ast.Expr, error) {
 	}
 	args := make([]ast.Expr, 0, len(parts)-1)
 	for _, p := range parts[1:] {
+		p = strings.TrimSpace(p)
 		if p == "" {
+			args = append(args, ast.EmptyLit{})
 			continue
 		}
 		e, err := ParseExpr(p)
 		if err != nil {
-			return "", nil, err
+			args = append(args, ast.StringLit{Value: decodeCharSeq(p)})
+			continue
 		}
 		args = append(args, e)
 	}
@@ -766,12 +881,31 @@ func parseBareCall(raw string) (string, []ast.Expr, bool, error) {
 }
 
 func parseVarRefText(raw string) (ast.VarRef, error) {
-	expr, err := ParseExpr(strings.TrimSpace(raw))
+	trimmed := strings.TrimSpace(raw)
+	expr, err := ParseExpr(trimmed)
 	if err != nil {
+		if i := strings.IndexRune(trimmed, ':'); i > 0 {
+			rewritten := strings.TrimSpace(trimmed[:i]) + ":(" + strings.TrimSpace(trimmed[i+1:]) + ")"
+			expr2, err2 := ParseExpr(rewritten)
+			if err2 == nil {
+				if ref2, ok := expr2.(ast.VarRef); ok {
+					return ref2, nil
+				}
+			}
+		}
 		return ast.VarRef{}, err
 	}
 	ref, ok := expr.(ast.VarRef)
 	if !ok {
+		if i := strings.IndexRune(trimmed, ':'); i > 0 {
+			rewritten := strings.TrimSpace(trimmed[:i]) + ":(" + strings.TrimSpace(trimmed[i+1:]) + ")"
+			expr2, err2 := ParseExpr(rewritten)
+			if err2 == nil {
+				if ref2, ok2 := expr2.(ast.VarRef); ok2 {
+					return ref2, nil
+				}
+			}
+		}
 		return ast.VarRef{}, fmt.Errorf("invalid variable target: %q", raw)
 	}
 	return ref, nil
@@ -819,26 +953,38 @@ func splitAssign(raw string) *assignParts {
 			}
 			prev := rune(0)
 			next := rune(0)
+			prev2 := rune(0)
 			if i > 0 {
 				prev = runes[i-1]
+			}
+			if i > 1 {
+				prev2 = runes[i-2]
 			}
 			if i+1 < len(runes) {
 				next = runes[i+1]
 			}
-			if prev == '<' || prev == '>' || prev == '!' || prev == '=' || next == '=' {
+			if next == '=' || prev == '!' || prev == '=' {
+				continue
+			}
+			if (prev == '<' || prev == '>') && prev2 != prev {
 				continue
 			}
 			left := strings.TrimSpace(string(runes[:i]))
 			right := strings.TrimSpace(string(runes[i+1:]))
-			if left == "" || right == "" {
+			if left == "" {
 				return nil
 			}
 			op := "="
-			for _, c := range []string{"+", "-", "*", "/", "%", "&", "|", "^"} {
-				if strings.HasSuffix(left, c) {
-					op = c + "="
-					left = strings.TrimSpace(left[:len(left)-1])
-					break
+			if strings.HasSuffix(left, "'") {
+				op = "'="
+				left = strings.TrimSpace(left[:len(left)-1])
+			} else {
+				for _, c := range []string{"<<", ">>", "+", "-", "*", "/", "%", "&", "|", "^"} {
+					if strings.HasSuffix(left, c) {
+						op = c + "="
+						left = strings.TrimSpace(left[:len(left)-len(c)])
+						break
+					}
 				}
 			}
 			return &assignParts{Left: left, Op: op, Right: right}

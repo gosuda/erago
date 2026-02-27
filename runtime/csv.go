@@ -9,16 +9,23 @@ import (
 type CSVStore struct {
 	rowsByBase     map[string][][]string
 	nameByBase     map[string]map[int64]string
+	charaExists    map[int64]struct{}
 	gameCode       int64
 	gameVersion    int64
 	hasGameCode    bool
 	hasGameVersion bool
+	gameTitle      string
+	gameAuthor     string
+	gameYear       string
+	windowTitle    string
+	gameInfo       string
 }
 
 func newCSVStore(files map[string]string) *CSVStore {
 	s := &CSVStore{
 		rowsByBase:  map[string][][]string{},
 		nameByBase:  map[string]map[int64]string{},
+		charaExists: map[int64]struct{}{},
 		gameCode:    0,
 		gameVersion: 0,
 	}
@@ -26,6 +33,9 @@ func newCSVStore(files map[string]string) *CSVStore {
 		base := csvBaseName(file)
 		if base == "" {
 			continue
+		}
+		if id, ok := charaIDFromBase(base); ok {
+			s.charaExists[id] = struct{}{}
 		}
 		rows := parseCSVContent(content)
 		s.rowsByBase[base] = rows
@@ -47,6 +57,16 @@ func newCSVStore(files map[string]string) *CSVStore {
 						s.gameVersion = n
 						s.hasGameVersion = true
 					}
+				case "TITLE", "タイトル", "타이틀":
+					s.gameTitle = val
+				case "AUTHOR", "作者", "작자", "저자":
+					s.gameAuthor = val
+				case "YEAR", "製作年", "제작년":
+					s.gameYear = val
+				case "WINDOWTITLE", "ウィンドウタイトル", "윈도우타이틀":
+					s.windowTitle = val
+				case "INFO", "追加情報", "추가정보":
+					s.gameInfo = val
 				}
 			}
 		}
@@ -67,6 +87,7 @@ func newCSVStore(files map[string]string) *CSVStore {
 }
 
 func parseCSVContent(raw string) [][]string {
+	raw = strings.TrimPrefix(raw, "\uFEFF")
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 	raw = strings.ReplaceAll(raw, "\r", "\n")
 	lines := strings.Split(raw, "\n")
@@ -133,6 +154,17 @@ func (s *CSVStore) Exists(base string) bool {
 	return ok
 }
 
+func (s *CSVStore) ExistsID(id int64) bool {
+	if _, ok := s.charaExists[id]; ok {
+		return true
+	}
+	if m := s.nameByBase["RELATION"]; m != nil {
+		_, ok := m[id]
+		return ok
+	}
+	return false
+}
+
 func (s *CSVStore) FindID(base, name string) (int64, bool) {
 	base = strings.ToUpper(strings.TrimSpace(base))
 	rows := s.rowsByBase[base]
@@ -158,4 +190,27 @@ func (s *CSVStore) FindID(base, name string) (int64, bool) {
 
 func (s *CSVStore) GameCodeVersion() (code int64, version int64, hasCode bool, hasVersion bool) {
 	return s.gameCode, s.gameVersion, s.hasGameCode, s.hasGameVersion
+}
+
+func (s *CSVStore) GameMeta() (title, author, year, windowTitle, info string) {
+	return s.gameTitle, s.gameAuthor, s.gameYear, s.windowTitle, s.gameInfo
+}
+
+func charaIDFromBase(base string) (int64, bool) {
+	base = strings.ToUpper(strings.TrimSpace(base))
+	if !strings.HasPrefix(base, "CHARA") {
+		return 0, false
+	}
+	i := len("CHARA")
+	for i < len(base) && base[i] >= '0' && base[i] <= '9' {
+		i++
+	}
+	if i == len("CHARA") {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(base[len("CHARA"):i], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
 }

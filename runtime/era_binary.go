@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -1065,15 +1064,6 @@ func denseStrToArray(flat []string, dims []int) *ArrayVar {
 		_ = arr.Set(idx, Str(v))
 	}
 	return arr
-}
-
-func sortedKeysFromMap[K ~string, V any](m map[K]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, string(k))
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func IsEraBinaryData(data []byte) bool {

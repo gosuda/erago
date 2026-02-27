@@ -40,7 +40,7 @@ func runVM(cfg appConfig, events chan<- tea.Msg) {
 		return r.value, r.timeout, nil
 	})
 
-	_, err = vm.Run(cfg.entry)
+	err = runWithEntryFallback(vm, cfg.entry)
 	events <- vmDoneMsg{err: err}
 }
 
@@ -57,15 +57,19 @@ func loadScripts(root string) (map[string]string, error) {
 		if ext != ".ERB" && ext != ".ERH" && ext != ".CSV" {
 			return nil
 		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			rel = filepath.Base(path)
 		}
-		files[filepath.ToSlash(rel)] = string(b)
+		rel = filepath.ToSlash(rel)
+		if !isInGameScriptTree(rel) {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		files[rel] = string(b)
 		return nil
 	})
 	if err != nil {
@@ -75,4 +79,42 @@ func loadScripts(root string) (map[string]string, error) {
 		return nil, fmt.Errorf("no script files found under %s", root)
 	}
 	return files, nil
+}
+
+func runWithEntryFallback(vm *eruntime.VM, preferred string) error {
+	candidates := []string{
+		strings.TrimSpace(preferred),
+		"TITLE",
+		"SYSTEM_TITLE",
+		"START",
+		"SYSTEM_START",
+		"START_SELECT",
+	}
+	seen := map[string]struct{}{}
+	var lastErr error
+	for _, c := range candidates {
+		c = strings.ToUpper(strings.TrimSpace(c))
+		if c == "" {
+			continue
+		}
+		if _, ok := seen[c]; ok {
+			continue
+		}
+		seen[c] = struct{}{}
+		_, err := vm.Run(c)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !strings.Contains(err.Error(), "function "+c+" not found") {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func isInGameScriptTree(rel string) bool {
+	parts := strings.SplitN(rel, "/", 2)
+	top := strings.ToUpper(strings.TrimSpace(parts[0]))
+	return top == "ERB" || top == "ERH" || top == "CSV"
 }

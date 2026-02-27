@@ -27,6 +27,7 @@ type Function struct {
 
 type Arg struct {
 	Name    string
+	Target  VarRef
 	Default Expr
 }
 
@@ -102,11 +103,12 @@ type RepeatStmt struct {
 func (RepeatStmt) isStatement() {}
 
 type ForStmt struct {
-	Var   string
-	Init  Expr
-	Limit Expr
-	Step  Expr
-	Body  *Thunk
+	Var    string
+	Target VarRef
+	Init   Expr
+	Limit  Expr
+	Step   Expr
+	Body   *Thunk
 }
 
 func (ForStmt) isStatement() {}
@@ -226,3 +228,30 @@ type BinaryExpr struct {
 }
 
 func (BinaryExpr) isExpr() {}
+
+type TernaryExpr struct {
+	Cond  Expr
+	True  Expr
+	False Expr
+}
+
+func (TernaryExpr) isExpr() {}
+
+type CallExpr struct {
+	Name string
+	Args []Expr
+}
+
+func (CallExpr) isExpr() {}
+
+type EmptyLit struct{}
+
+func (EmptyLit) isExpr() {}
+
+type IncDecExpr struct {
+	Target VarRef
+	Op     string
+	Post   bool
+}
+
+func (IncDecExpr) isExpr() {}
